@@ -54,7 +54,6 @@ jobs:
           name: Qingdan-Windows-Installers
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/msi/*.msi
           if-no-files-found: error
       - name: Publish public v1.0.0 release
         shell: pwsh
@@ -71,6 +70,5 @@ jobs:
           }
           $assets = @("staging/Qingdan-Windows-Portable.zip")
           $assets += Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" | ForEach-Object { $_.FullName }
-          $assets += Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi" | ForEach-Object { $_.FullName }
           gh release upload v1.0.0 @assets --clobber --repo ${{ github.repository }}
 

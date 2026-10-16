@@ -11,7 +11,7 @@
 - SQLite 本地数据库、参数化查询、外键和索引
 - 手动备份、每日自动备份、备份校验和恢复前保护性备份
 - 浏览器开发预览：未运行在 Tauri 中时，自动使用 localStorage，不影响界面开发
-- Windows NSIS `.exe` 与 MSI 安装包配置
+- Windows NSIS `.exe` 安装包配置
 - GitHub Actions 自动构建 Windows 安装包
 
 ## 技术栈
@@ -21,7 +21,7 @@
 | 界面 | Vue 3、TypeScript、Vite |
 | 桌面容器 | Tauri 2 |
 | 本地数据 | Rust、SQLite（rusqlite bundled） |
-| 安装包 | Tauri NSIS / WiX MSI |
+| 安装包 | Tauri NSIS |
 
 ## 本地开发
 

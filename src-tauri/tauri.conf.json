@@ -28,7 +28,7 @@
   },
   "bundle": {
     "active": true,
-    "targets": ["nsis", "msi"],
+    "targets": ["nsis"],
     "publisher": "Qingdan",
     "shortDescription": "数据只保存在本机的待办事项应用",
     "longDescription": "清爽、快速、离线优先的待办事项桌面应用。所有任务、分类和备份均保存在用户自己的电脑上。",
