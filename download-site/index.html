@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="description" content="清单是一款数据只保存在本机的待办事项应用" />
+  <title>下载清单 · 本地待办</title>
+  <style>
+    :root{font-family:Inter,"Microsoft YaHei",system-ui,sans-serif;color:#1c2942;background:#f7f9fd}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at 70% 20%,#e7efff 0,transparent 31%),#f7f9fd}.wrap{width:min(1080px,92vw);margin:auto}nav{height:74px;display:flex;align-items:center;justify-content:space-between}.brand{display:flex;align-items:center;gap:10px;font-weight:800;font-size:20px}.logo{width:39px;height:39px;border-radius:11px;display:grid;place-items:center;background:linear-gradient(145deg,#4b82f4,#2d66dd);color:#fff;box-shadow:0 8px 22px #3974ed40}.nav-note{color:#718097;font-size:13px}.hero{min-height:610px;display:grid;grid-template-columns:1fr 1fr;align-items:center;gap:60px}.eyebrow{display:inline-block;padding:7px 10px;border-radius:8px;background:#e8f0ff;color:#3974ed;font-size:12px;font-weight:800}.hero h1{font-size:56px;line-height:1.08;letter-spacing:-.05em;margin:19px 0}.hero h1 span{color:#3974ed}.lead{font-size:17px;line-height:1.8;color:#6f7c92;margin:0 0 28px}.download{display:inline-flex;align-items:center;gap:10px;background:#3974ed;color:#fff;text-decoration:none;padding:14px 20px;border-radius:11px;font-weight:800;box-shadow:0 11px 28px #3974ed47}.meta{font-size:12px;color:#929baa;margin:12px 0}.preview{padding:13px;border-radius:22px;background:#fff;box-shadow:0 28px 80px #40547c24;transform:rotate(1.5deg)}.window{height:360px;border:1px solid #e6eaf1;border-radius:14px;overflow:hidden;background:#f7f9fc}.bar{height:36px;background:#fff;border-bottom:1px solid #e8ecf2;display:flex;align-items:center;padding:0 12px;gap:5px}.bar i{width:7px;height:7px;border-radius:50%;background:#dfe4ec}.demo{display:grid;grid-template-columns:110px 1fr;height:324px}.side{padding:16px 10px;border-right:1px solid #e6eaf1}.side b{display:block;background:#3974ed;color:#fff;border-radius:7px;padding:8px;font-size:9px;text-align:center;margin-bottom:12px}.side span{display:block;padding:8px;color:#7f899a;font-size:9px}.side .on{background:#e8f0ff;color:#3974ed;border-radius:6px}.content{padding:23px}.content h3{font-size:18px;margin:0 0 18px}.card{background:#fff;border:1px solid #e3e8f0;border-radius:9px;padding:12px;margin:8px 0;font-size:10px;box-shadow:0 3px 12px #243a6210}.card small{display:block;color:#98a1b0;margin-top:7px}.features{display:grid;grid-template-columns:repeat(3,1fr);gap:16px;padding:20px 0 90px}.features article{background:#fff;border:1px solid #e6eaf1;border-radius:15px;padding:23px}.features span{font-size:23px}.features h3{margin:14px 0 7px}.features p{margin:0;color:#7c8799;font-size:13px;line-height:1.6}footer{border-top:1px solid #e4e9f1;padding:24px 0;color:#8b95a5;font-size:12px}.foot{display:flex;justify-content:space-between}@media(max-width:760px){.hero{grid-template-columns:1fr;padding:50px 0}.hero h1{font-size:42px}.preview{display:none}.features{grid-template-columns:1fr}.nav-note{display:none}}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <nav><div class="brand"><span class="logo">✓</span>清单</div><span class="nav-note">离线优先 · 数据只在你的电脑</span></nav>
+    <main class="hero">
+      <section><span class="eyebrow">Windows 桌面应用</span><h1>事情很复杂，<br><span>清单可以很简单。</span></h1><p class="lead">清爽、快速、无需登录。所有任务都保存在你自己的电脑上，没有账号，没有云端，也没有订阅费。</p><a class="download" href="https://github.com/ztahaa/qingdan-desktop/releases/download/v1.0.0/Qingdan-Windows-Portable.zip">↓ 下载 Windows 便携版</a><p class="meta">支持 Windows 10 / 11 · 免费开源 · v1.0.0</p></section>
+      <section class="preview"><div class="window"><div class="bar"><i></i><i></i><i></i></div><div class="demo"><div class="side"><b>＋ 新建任务</b><span class="on">☀ 今日任务</span><span>▣ 收集箱</span><span>◷ 即将到期</span><span>✓ 已完成</span></div><div class="content"><h3>今日任务</h3><div class="card">○ 完成项目周报<small>工作 · 今天 18:00</small></div><div class="card">○ 预约体检<small>生活 · 明天 10:00</small></div><div class="card">✓ 整理桌面文件<small>已完成</small></div></div></div></div></section>
+    </main>
+    <section class="features"><article><span>⌂</span><h3>数据属于你</h3><p>SQLite 数据库和备份全部保存在本机，不上传任务内容。</p></article><article><span>⚡</span><h3>打开就能用</h3><p>无需注册和配置，安装后立即记录、分类和完成任务。</p></article><article><span>↧</span><h3>随时可备份</h3><p>自动每日备份，也可手动创建备份并一键恢复。</p></article></section>
+    <footer><div class="foot"><span>© 2026 清单</span><span>本地存储 · 无需账号 · MIT 开源</span></div></footer>
+  </div>
+</body>
+</html>
+

@@ -1,0 +1,76 @@
+name: Build Qingdan for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install dependencies
+        run: npm ci
+      - name: Verify frontend
+        run: npm run build
+      - name: Build desktop app
+        run: npm run desktop:build
+      - name: Prepare portable package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path staging/Qingdan/data | Out-Null
+          Copy-Item src-tauri/target/release/qingdan-desktop.exe staging/Qingdan/Qingdan.exe
+          Set-Content -Path staging/Qingdan/portable.mode -Value "Store app data beside the executable." -Encoding ascii
+          @"
+          Qingdan portable edition
+
+          1. Extract the Qingdan folder to D:\Qingdan (or another writable folder).
+          2. Double-click Qingdan.exe.
+          3. Tasks and backups are stored in the data folder beside the program.
+
+          Do not run the program directly from inside the downloaded ZIP.
+          "@ | Set-Content -Path staging/Qingdan/README.txt -Encoding utf8
+          Compress-Archive -Path staging/Qingdan -DestinationPath staging/Qingdan-Windows-Portable.zip -Force
+      - name: Upload portable edition
+        uses: actions/upload-artifact@v4
+        with:
+          name: Qingdan-Windows-Portable
+          path: staging/Qingdan
+          if-no-files-found: error
+      - name: Upload installers
+        uses: actions/upload-artifact@v4
+        with:
+          name: Qingdan-Windows-Installers
+          path: |
+            src-tauri/target/release/bundle/nsis/*.exe
+            src-tauri/target/release/bundle/msi/*.msi
+          if-no-files-found: error
+      - name: Publish public v1.0.0 release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view v1.0.0 --repo ${{ github.repository }} *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create v1.0.0 `
+              --repo ${{ github.repository }} `
+              --target ${{ github.sha }} `
+              --title "清单 v1.0.0" `
+              --notes "本地优先的 Windows 待办事项应用。任务和备份只保存在使用者自己的电脑上。"
+          }
+          $assets = @("staging/Qingdan-Windows-Portable.zip")
+          $assets += Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" | ForEach-Object { $_.FullName }
+          $assets += Get-ChildItem "src-tauri/target/release/bundle/msi/*.msi" | ForEach-Object { $_.FullName }
+          gh release upload v1.0.0 @assets --clobber --repo ${{ github.repository }}
+
