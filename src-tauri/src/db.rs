@@ -204,8 +204,9 @@ fn all_tasks(conn: &Connection) -> Result<Vec<Task>, String> {
                 t.created_at,t.updated_at,t.completed_at,t.deleted_at
          FROM tasks t LEFT JOIN categories c ON c.id=t.category_id"
     ).map_err(|e| e.to_string())?;
-    stmt.query_map([], row_to_task).map_err(|e| e.to_string())?
-        .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    let tasks = stmt.query_map([], row_to_task).map_err(|e| e.to_string())?
+        .collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    Ok(tasks)
 }
 
 fn local_date(value: &str) -> Option<chrono::NaiveDate> {
@@ -343,8 +344,9 @@ pub fn stats_get(state: State<'_, AppState>) -> Result<Stats, String> {
 pub fn category_list(state: State<'_, AppState>) -> Result<Vec<Category>, String> {
     let conn = open(&state.db_path)?;
     let mut stmt = conn.prepare("SELECT id,name,color,sort_order FROM categories ORDER BY sort_order,name").map_err(|e| e.to_string())?;
-    stmt.query_map([], |row| Ok(Category { id: row.get(0)?, name: row.get(1)?, color: row.get(2)?, sort_order: row.get(3)? }))
-        .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())
+    let categories = stmt.query_map([], |row| Ok(Category { id: row.get(0)?, name: row.get(1)?, color: row.get(2)?, sort_order: row.get(3)? }))
+        .map_err(|e| e.to_string())?.collect::<Result<Vec<_>, _>>().map_err(|e| e.to_string())?;
+    Ok(categories)
 }
 
 #[tauri::command]
