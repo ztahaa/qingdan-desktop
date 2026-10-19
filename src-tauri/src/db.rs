@@ -36,33 +36,33 @@ pub struct CategoryInput {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct TaskImage {
-    id: String,
-    name: String,
-    data_url: String,
-    created_at: String,
+    pub(crate) id: String,
+    pub(crate) name: String,
+    pub(crate) data_url: String,
+    pub(crate) created_at: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
-    id: String,
-    title: String,
-    description: String,
-    status: String,
-    priority: String,
-    due_at: Option<String>,
-    category_id: Option<String>,
-    category_name: Option<String>,
-    category_color: Option<String>,
-    created_at: String,
-    updated_at: String,
-    completed_at: Option<String>,
-    deleted_at: Option<String>,
-    images: Vec<TaskImage>,
-    local_path: Option<String>,
-    sms_reminder: bool,
+    pub(crate) id: String,
+    pub(crate) title: String,
+    pub(crate) description: String,
+    pub(crate) status: String,
+    pub(crate) priority: String,
+    pub(crate) due_at: Option<String>,
+    pub(crate) category_id: Option<String>,
+    pub(crate) category_name: Option<String>,
+    pub(crate) category_color: Option<String>,
+    pub(crate) created_at: String,
+    pub(crate) updated_at: String,
+    pub(crate) completed_at: Option<String>,
+    pub(crate) deleted_at: Option<String>,
+    pub(crate) images: Vec<TaskImage>,
+    pub(crate) local_path: Option<String>,
+    pub(crate) sms_reminder: bool,
     #[serde(default)]
-    email_reminder: bool,
+    pub(crate) email_reminder: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -301,7 +301,7 @@ fn validate_input(input: &TaskInput) -> Result<(), String> {
     Ok(())
 }
 
-fn load_task(conn: &Connection, id: &str) -> Result<Task, String> {
+pub(crate) fn load_task(conn: &Connection, id: &str) -> Result<Task, String> {
     conn.query_row(
         "SELECT t.id,t.title,t.description,t.status,t.priority,t.due_at,t.category_id,c.name,c.color,
                 t.created_at,t.updated_at,t.completed_at,t.deleted_at,t.images_json,t.local_path,t.sms_reminder,t.email_reminder

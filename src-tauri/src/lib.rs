@@ -1,6 +1,7 @@
 mod db;
 mod directories;
 mod reminders;
+mod mail_content;
 
 use std::fs;
 use tauri::Manager;

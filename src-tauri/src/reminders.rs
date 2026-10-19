@@ -1,5 +1,5 @@
 use crate::db::{self, AppSettings, AppState};
-use chrono::{DateTime, Duration, Local, Utc};
+use chrono::{DateTime, Duration, Utc};
 use lettre::{message::header::ContentType, transport::smtp::authentication::Credentials, Message, SmtpTransport, Transport};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::Serialize;
@@ -100,13 +100,14 @@ pub fn email_retry_failed(state: State<'_, AppState>) -> Result<usize, String> {
 }
 
 #[derive(Debug, Clone)]
-enum SendFailure { Temporary, Permanent, Uncertain }
+enum SendFailure { Temporary, Permanent, Uncertain, Content(crate::mail_content::ContentError) }
 impl SendFailure {
     fn message(&self) -> &'static str {
         match self {
             Self::Temporary => "邮件服务暂时拒绝，将自动重试；请检查网络或稍后再试",
             Self::Permanent => "邮箱服务拒绝发送，请检查 SMTP 是否开启、授权码是否正确及邮箱发送限制",
             Self::Uncertain => "连接中断或超时，发送结果不确定；请先检查收件箱，系统不会自动重发以避免重复",
+            Self::Content(error) => error.message(),
         }
     }
 }
@@ -154,14 +155,14 @@ fn load_settings(conn: &Connection) -> Result<AppSettings, String> {
     raw.map(|value| serde_json::from_str(&value).map_err(|e| e.to_string())).unwrap_or(Ok(AppSettings::default()))
 }
 
-struct Delivery { key: String, title: String, due_at: String, message_id: String }
+struct Delivery { key: String, task_id: String, message_id: String }
 fn claim_next(conn: &Connection, address: &str, now: DateTime<Utc>) -> Result<Option<Delivery>, String> {
     let candidates: Vec<(String, String, String)> = {
         let mut statement = conn.prepare("SELECT id,title,due_at FROM tasks WHERE status='todo' AND deleted_at IS NULL AND email_reminder=1 AND due_at IS NOT NULL ORDER BY due_at").map_err(|e| e.to_string())?;
         let rows = statement.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).map_err(|e| e.to_string())?;
         rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
     };
-    for (task_id, title, due_at) in candidates {
+    for (task_id, _title, due_at) in candidates {
         let due = match DateTime::parse_from_rfc3339(&due_at) { Ok(value) => value.with_timezone(&Utc), Err(_) => continue };
         if due > now || due < now - Duration::hours(24) { continue; }
         let key = format!("qq-email:{task_id}:{due_at}:{address}");
@@ -169,7 +170,7 @@ fn claim_next(conn: &Connection, address: &str, now: DateTime<Utc>) -> Result<Op
         let (kind, attempts, next, message_id): (String, i64, String, String) = conn.query_row("SELECT state,attempts,next_attempt,message_id FROM email_deliveries WHERE delivery_key=?1", [&key], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))).map_err(|e| e.to_string())?;
         if kind != "pending" || attempts >= 3 || next > now.to_rfc3339() { continue; }
         let changed = conn.execute("UPDATE email_deliveries SET state='sending',attempts=attempts+1 WHERE delivery_key=?1 AND state='pending'", [&key]).map_err(|e| e.to_string())?;
-        if changed == 1 { return Ok(Some(Delivery { key, title, due_at, message_id })); }
+        if changed == 1 { return Ok(Some(Delivery { key, task_id, message_id })); }
     }
     Ok(None)
 }
@@ -183,6 +184,7 @@ fn finish(conn: &Connection, delivery: &Delivery, result: Result<(), SendFailure
         }
         Err(SendFailure::Permanent) => ("failed", Some(SendFailure::Permanent.message()), None),
         Err(SendFailure::Uncertain) => ("uncertain", Some(SendFailure::Uncertain.message()), None),
+        Err(SendFailure::Content(ref error)) => ("failed", Some(error.message()), None),
     };
     conn.execute("UPDATE email_deliveries SET state=?2,last_error=?3,sent_at=?4,next_attempt=?5 WHERE delivery_key=?1", params![delivery.key, kind, error, sent, (now + Duration::seconds(60)).to_rfc3339()]).map_err(|e| e.to_string())?;
     Ok(())
@@ -211,7 +213,7 @@ pub(crate) fn recover_interrupted(conn: &Connection) -> Result<(), String> {
 }
 fn deliver_next(app: &tauri::AppHandle) -> Result<(), String> {
     let state = app.state::<AppState>();
-    let (delivery, address, code) = {
+    let (delivery, address, code, task) = {
         let _guard = state.operations.lock().map_err(|_| "数据操作锁失败")?;
         let conn = db::open(&state.db_path)?;
         let settings = load_settings(&conn)?;
@@ -219,14 +221,13 @@ fn deliver_next(app: &tauri::AppHandle) -> Result<(), String> {
         let address = normalize_address(&settings.email_address)?;
         let code = read_code(&address)?;
         let delivery = match claim_next(&conn, &address, Utc::now())? { Some(value) => value, None => return Ok(()) };
-        (delivery, address, code)
+        let task = db::load_task(&conn, &delivery.task_id)?;
+        (delivery, address, code, task)
     };
-    let due = DateTime::parse_from_rfc3339(&delivery.due_at).map(|date| date.with_timezone(&Local).format("%Y-%m-%d %H:%M:%S %:z").to_string()).unwrap_or_else(|_| delivery.due_at.clone());
-    let body = format!("你在清单中设置的任务已到期：\n\n事项：{}\n截止时间：{}\n\n请打开清单查看或完成任务。此邮件由你的电脑发送，不包含图片附件和本地目录。", delivery.title, due);
-    // No database mutex is held during the SMTP connection; the UI can continue editing tasks.
-    let result = match message(&address, &format!("清单到期提醒：{}", delivery.title), &body, &delivery.message_id) {
+    // A complete task snapshot is loaded under the data lock, then encoded/sent outside it.
+    let result = match crate::mail_content::task_message(&address, &task, &delivery.message_id) {
         Ok(mail) => QqSender.send(&address, &code, &mail),
-        Err(_) => Err(SendFailure::Permanent),
+        Err(error) => Err(SendFailure::Content(error)),
     };
     let _guard = state.operations.lock().map_err(|_| "数据操作锁失败")?;
     finish(&db::open(&state.db_path)?, &delivery, result, Utc::now())
@@ -324,4 +325,20 @@ mod tests {
         assert!(bytes.contains("<qingdan-unit-test@qingdan.local>"));
         assert!(!bytes.contains("\r\nBcc:"));
     }
+
+    #[test]
+    fn failed_full_content_is_recorded_as_failed_and_not_sent() {
+        let (path, conn) = fixture();
+        let now = Utc::now();
+        add(&conn, "bad-content", now - Duration::minutes(1), "todo", false, true);
+        let delivery = claim_next(&conn, "123456@qq.com", now).unwrap().unwrap();
+        finish(&conn, &delivery, Err(SendFailure::Content(crate::mail_content::ContentError::InvalidImage)), now).unwrap();
+        let (state, error, sent): (String, String, Option<String>) = conn.query_row("SELECT state,last_error,sent_at FROM email_deliveries", [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?))).unwrap();
+        assert_eq!(state, "failed");
+        assert!(error.contains("图片"));
+        assert!(sent.is_none());
+        assert!(claim_next(&conn, "123456@qq.com", now + Duration::minutes(5)).unwrap().is_none());
+        cleanup(path, conn);
+    }
+
 }

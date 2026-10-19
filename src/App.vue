@@ -546,7 +546,7 @@ onMounted(async () => {
           <p class="helper" role="status">{{ api.desktop ? (emailStatus.configured ? '授权码已保存' : '此邮箱授权码未配置') : '请使用 Windows 桌面版配置邮件' }}；已受理 {{ emailStatus.sent }} 条，失败 {{ emailStatus.failed }} 条，结果不确定 {{ emailStatus.uncertain }} 条。受理不保证手机提示，请检查收件箱和垃圾邮件。</p>
           <p v-if="emailStatus.lastError" class="helper mail-error">{{ emailStatus.lastError }}</p>
         </section>
-        <div class="about-card"><strong>清单 v1.2.0</strong><span>离线优先 · 本地存储 · 无需账号</span></div>
+        <div class="about-card"><strong>清单 v1.2.1</strong><span>离线优先 · 本地存储 · 无需账号</span></div>
         <div class="modal-actions"><button class="plain-button" @click="closeSettings">取消</button><button class="primary-button" :disabled="mailBusy" @click="saveSettings">保存设置</button></div>
       </section>
     </div>
