@@ -1,12 +1,19 @@
 export type Priority = 'low' | 'medium' | 'high'
 export type TaskStatus = 'todo' | 'completed'
-export type ViewKey = 'today' | 'inbox' | 'upcoming' | 'all' | 'completed' | 'trash'
+export type ViewKey = 'today' | 'inbox' | 'upcoming' | 'all' | 'unfinished' | 'completed' | 'trash'
 
 export interface Category {
   id: string
   name: string
   color: string
   sortOrder: number
+}
+
+export interface TaskImage {
+  id: string
+  name: string
+  dataUrl: string
+  createdAt: string
 }
 
 export interface Task {
@@ -23,6 +30,9 @@ export interface Task {
   updatedAt: string
   completedAt: string | null
   deletedAt: string | null
+  images?: TaskImage[]
+  localPath?: string | null
+  smsReminder?: boolean
 }
 
 export interface TaskInput {
@@ -31,6 +41,9 @@ export interface TaskInput {
   priority: Priority
   dueAt: string | null
   categoryId: string | null
+  images?: TaskImage[]
+  localPath?: string | null
+  smsReminder?: boolean
 }
 
 export interface TaskFilter {
@@ -44,6 +57,7 @@ export interface Stats {
   inbox: number
   upcoming: number
   all: number
+  unfinished: number
   completed: number
   trash: number
   overdue: number
@@ -61,4 +75,8 @@ export interface AppSettings {
   startView: ViewKey
   theme: 'light' | 'system'
   dailyBackup: boolean
+  smsEnabled?: boolean
+  smsPhone?: string
+  smsWebhookUrl?: string
 }
+

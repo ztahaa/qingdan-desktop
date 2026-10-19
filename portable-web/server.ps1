@@ -50,6 +50,7 @@ function Read-Request($Stream) {
   }
   $Length = 0
   if ($Headers.ContainsKey("content-length")) { $Length = [int]$Headers["content-length"] }
+  if ($Length -lt 0 -or $Length -gt 67108864) { throw "Request too large" }
   $Body = New-Object byte[] $Length
   $Offset = 0
   while ($Offset -lt $Length) {
@@ -57,7 +58,8 @@ function Read-Request($Stream) {
     if ($Read -le 0) { break }
     $Offset += $Read
   }
-  return [PSCustomObject]@{ Method = $First[0]; Path = $First[1].Split("?")[0]; Body = $Body }
+  if ($Offset -ne $Length) { throw "Incomplete request" }
+  return [PSCustomObject]@{ Method = $First[0]; Path = $First[1].Split("?")[0]; Body = $Body; Headers = $Headers }
 }
 
 function Get-MimeType([string]$Path) {
@@ -91,6 +93,27 @@ try {
     try {
       $Stream = $Client.GetStream()
       $Request = Read-Request $Stream
+
+      if ($Request.Headers["host"] -ne "127.0.0.1:$Port") {
+        Send-Response $Stream 400 "text/plain" ($Utf8.GetBytes("Invalid host"))
+        continue
+      }
+      if ($Request.Method -ne "GET" -and $Request.Headers["origin"] -ne "http://127.0.0.1:$Port") {
+        Send-Response $Stream 400 "text/plain" ($Utf8.GetBytes("Invalid origin"))
+        continue
+      }
+      if ($Request.Path -eq "/api/open-directory" -and $Request.Method -eq "POST") {
+        $InputData = $Utf8.GetString($Request.Body) | ConvertFrom-Json
+        $Folder = [string]$InputData.path
+        if (-not [System.IO.Path]::IsPathRooted($Folder) -or $Folder.Contains('"') -or -not (Test-Path -LiteralPath $Folder -PathType Container)) {
+          Send-Response $Stream 400 "text/plain" ($Utf8.GetBytes("Invalid directory"))
+          continue
+        }
+        $Folder = (Resolve-Path -LiteralPath $Folder).Path
+        Start-Process -FilePath "explorer.exe" -ArgumentList ('"' + $Folder + '"')
+        Send-Response $Stream 204 "text/plain" ([byte[]]@())
+        continue
+      }
 
       if ($Request.Path -eq "/api/state") {
         if ($Request.Method -eq "GET") {
@@ -134,4 +157,5 @@ try {
   $Listener.Stop()
   if (Test-Path $PidFile) { Remove-Item $PidFile -Force }
 }
+
 

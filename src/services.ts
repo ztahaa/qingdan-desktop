@@ -118,7 +118,8 @@ function matchesFilter(task: Task, filter: TaskFilter) {
     end.setHours(23, 59, 59, 999)
     if (!(active && due && due > today && due <= end)) return false
   }
-  if (filter.view === 'all' && !active) return false
+  if (filter.view === 'unfinished' && !active) return false
+  if (filter.view === 'all' && task.deletedAt) return false
   if (filter.view === 'completed' && !(task.status === 'completed' && !task.deletedAt)) return false
   if (filter.view === 'trash' && !task.deletedAt) return false
   if (filter.view === 'category' && !(active && task.categoryId === filter.categoryId)) return false
@@ -169,6 +170,41 @@ export const api = {
     await persistPortable()
   },
 
+  async deleteTasks(taskIds: string[], permanent = false): Promise<void> {
+    if (isDesktop()) return command('task_delete_many', { taskIds, permanent })
+    await ensurePortable()
+    const ids = new Set(taskIds)
+    const stamp = now()
+    write(TASK_KEY, tasksLocal().flatMap(task => {
+      if (!ids.has(task.id)) return [task]
+      if (permanent) {
+        if (!task.deletedAt) throw new Error('只能永久删除回收站中的任务')
+        return []
+      }
+      return [{ ...task, deletedAt: stamp, updatedAt: stamp }]
+    }))
+    await persistPortable()
+  },
+
+  async pickDirectory(): Promise<string | null> {
+    if (!isDesktop()) throw new Error('请手动输入文件夹的完整路径')
+    return command('directory_pick')
+  },
+
+  async openDirectory(path: string): Promise<void> {
+    if (isDesktop()) return command('directory_open', { path })
+    if (!isPortableServer()) throw new Error('请使用 Windows 桌面版打开本地文件夹')
+    const response = await fetch('/api/open-directory', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path })
+    })
+    if (!response.ok) throw new Error('文件夹不存在或无法打开')
+  },
+
+  async smsStatus(): Promise<string> {
+    if (!isDesktop()) return '短信提醒需要 Windows 桌面版'
+    return command('sms_status')
+  },
+
   async restoreTask(taskId: string): Promise<void> {
     if (isDesktop()) return command('task_restore', { taskId })
     await ensurePortable()
@@ -189,7 +225,8 @@ export const api = {
       today: active.filter(task => task.dueAt && isSameDay(new Date(task.dueAt), current)).length,
       inbox: active.filter(task => !task.categoryId).length,
       upcoming: active.filter(task => task.dueAt && new Date(task.dueAt) > current && new Date(task.dueAt) <= end).length,
-      all: active.length,
+      all: tasks.filter(task => !task.deletedAt).length,
+      unfinished: active.length,
       completed: tasks.filter(task => !task.deletedAt && task.status === 'completed').length,
       trash: tasks.filter(task => task.deletedAt).length,
       overdue: active.filter(task => task.dueAt && new Date(task.dueAt) < current && !isSameDay(new Date(task.dueAt), current)).length,
@@ -258,6 +295,7 @@ export const api = {
     const backup = read<(BackupInfo & { snapshot: string })[]>(BACKUP_KEY, []).find(item => item.name === path || item.path === path)
     if (!backup) throw new Error('找不到备份')
     const data = JSON.parse(backup.snapshot)
+    await this.createBackup()
     write(TASK_KEY, data.tasks)
     write(CATEGORY_KEY, data.categories)
     write(SETTINGS_KEY, data.settings)
@@ -272,3 +310,4 @@ export const api = {
     await persistPortable()
   }
 }
+

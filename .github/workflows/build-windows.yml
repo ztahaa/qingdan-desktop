@@ -5,6 +5,9 @@ on:
   push:
     branches:
       - main
+      - "codex/**"
+  pull_request:
+    branches: [main]
 
 permissions:
   contents: write
@@ -24,12 +27,16 @@ jobs:
         run: npm ci
       - name: Verify frontend
         run: npm run build
+      - name: Test database migrations and backups
+        working-directory: src-tauri
+        run: cargo test --lib
       - name: Build desktop app
         run: npm run desktop:build
       - name: Prepare portable package
         shell: pwsh
         run: |
-          New-Item -ItemType Directory -Force -Path staging/Qingdan/data | Out-Null
+          New-Item -ItemType Directory -Force -Path staging/Qingdan | Out-Null
+          Copy-Item scripts/update-portable.ps1 staging/Qingdan/update-portable.ps1
           Copy-Item src-tauri/target/release/qingdan-desktop.exe staging/Qingdan/Qingdan.exe
           Set-Content -Path staging/Qingdan/portable.mode -Value "Store app data beside the executable." -Encoding ascii
           @"
@@ -38,6 +45,9 @@ jobs:
           1. Extract the Qingdan folder to D:\Qingdan (or another writable folder).
           2. Double-click Qingdan.exe.
           3. Tasks and backups are stored in the data folder beside the program.
+
+          To update: close Qingdan and run update-portable.ps1 from this NEW package.
+          Choose the existing application folder. Only the program is replaced; data is preserved.
 
           Do not run the program directly from inside the downloaded ZIP.
           "@ | Set-Content -Path staging/Qingdan/README.txt -Encoding utf8
@@ -55,20 +65,3 @@ jobs:
           path: |
             src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
-      - name: Publish public v1.0.0 release
-        shell: pwsh
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh release view v1.0.0 --repo ${{ github.repository }} *> $null
-          if ($LASTEXITCODE -ne 0) {
-            gh release create v1.0.0 `
-              --repo ${{ github.repository }} `
-              --target ${{ github.sha }} `
-              --title "清单 v1.0.0" `
-              --notes "本地优先的 Windows 待办事项应用。任务和备份只保存在使用者自己的电脑上。"
-          }
-          $assets = @("staging/Qingdan-Windows-Portable.zip")
-          $assets += Get-ChildItem "src-tauri/target/release/bundle/nsis/*.exe" | ForEach-Object { $_.FullName }
-          gh release upload v1.0.0 @assets --clobber --repo ${{ github.repository }}
-

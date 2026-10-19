@@ -1,5 +1,5 @@
 use chrono::{DateTime, Local, Utc};
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use rusqlite::{params, Connection, DatabaseName, OptionalExtension, Row};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
@@ -12,6 +12,7 @@ use uuid::Uuid;
 pub struct AppState {
     pub db_path: PathBuf,
     pub backup_dir: PathBuf,
+    pub operations: std::sync::Mutex<()>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -32,6 +33,15 @@ pub struct CategoryInput {
     sort_order: Option<i64>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
+pub struct TaskImage {
+    id: String,
+    name: String,
+    data_url: String,
+    created_at: String,
+}
+
 #[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
@@ -48,6 +58,9 @@ pub struct Task {
     updated_at: String,
     completed_at: Option<String>,
     deleted_at: Option<String>,
+    images: Vec<TaskImage>,
+    local_path: Option<String>,
+    sms_reminder: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -58,6 +71,11 @@ pub struct TaskInput {
     priority: String,
     due_at: Option<String>,
     category_id: Option<String>,
+    #[serde(default)]
+    images: Vec<TaskImage>,
+    local_path: Option<String>,
+    #[serde(default)]
+    sms_reminder: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -75,6 +93,7 @@ pub struct Stats {
     inbox: usize,
     upcoming: usize,
     all: usize,
+    unfinished: usize,
     completed: usize,
     trash: usize,
     overdue: usize,
@@ -87,6 +106,12 @@ pub struct AppSettings {
     start_view: String,
     theme: String,
     daily_backup: bool,
+    #[serde(default)]
+    pub sms_enabled: bool,
+    #[serde(default)]
+    pub sms_phone: String,
+    #[serde(default)]
+    pub sms_webhook_url: String,
 }
 
 impl Default for AppSettings {
@@ -95,6 +120,9 @@ impl Default for AppSettings {
             start_view: "today".into(),
             theme: "light".into(),
             daily_backup: true,
+            sms_enabled: false,
+            sms_phone: String::new(),
+            sms_webhook_url: String::new(),
         }
     }
 }
@@ -108,7 +136,7 @@ pub struct BackupInfo {
     size: u64,
 }
 
-fn open(path: &Path) -> Result<Connection, String> {
+pub(crate) fn open(path: &Path) -> Result<Connection, String> {
     let conn = Connection::open(path).map_err(|e| e.to_string())?;
     conn.pragma_update(None, "foreign_keys", "ON").map_err(|e| e.to_string())?;
     conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| e.to_string())?;
@@ -156,9 +184,28 @@ pub fn initialize(path: &Path) -> Result<(), String> {
         );"
     ).map_err(|e| e.to_string())?;
 
+    let columns: Vec<String> = {
+        let mut statement = tx.prepare("PRAGMA table_info(tasks)").map_err(|e| e.to_string())?;
+        let rows = statement.query_map([], |row| row.get(1)).map_err(|e| e.to_string())?;
+        rows.collect::<Result<_, _>>().map_err(|e| e.to_string())?
+    };
+    for (name, sql) in [
+        ("images_json", "ALTER TABLE tasks ADD COLUMN images_json TEXT NOT NULL DEFAULT '[]'"),
+        ("local_path", "ALTER TABLE tasks ADD COLUMN local_path TEXT"),
+        ("sms_reminder", "ALTER TABLE tasks ADD COLUMN sms_reminder INTEGER NOT NULL DEFAULT 0"),
+    ] {
+        if !columns.iter().any(|column| column == name) {
+            tx.execute_batch(sql).map_err(|e| e.to_string())?;
+        }
+    }
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS sms_deliveries (
+        delivery_key TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+        sent_at TEXT, next_attempt TEXT NOT NULL, last_error TEXT
+    );").map_err(|e| e.to_string())?;
+
     let migration_count: i64 = tx.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0)).map_err(|e| e.to_string())?;
     let existing: i64 = tx.query_row("SELECT COUNT(*) FROM categories", [], |row| row.get(0)).map_err(|e| e.to_string())?;
-    if existing == 0 {
+    if existing == 0 && migration_count == 0 {
         let created = Utc::now().to_rfc3339();
         for (id, name, color, order) in [
             ("cat-work", "工作", "#5B8FF9", 0),
@@ -187,6 +234,7 @@ pub fn initialize(path: &Path) -> Result<(), String> {
         }
     }
     tx.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,?1)", [Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
+    tx.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,?1)", [Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
 }
 
@@ -195,13 +243,15 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         id: row.get(0)?, title: row.get(1)?, description: row.get(2)?, status: row.get(3)?, priority: row.get(4)?,
         due_at: row.get(5)?, category_id: row.get(6)?, category_name: row.get(7)?, category_color: row.get(8)?,
         created_at: row.get(9)?, updated_at: row.get(10)?, completed_at: row.get(11)?, deleted_at: row.get(12)?,
+        images: serde_json::from_str(&row.get::<_, String>(13)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(e)))?,
+        local_path: row.get(14)?, sms_reminder: row.get(15)?,
     })
 }
 
 fn all_tasks(conn: &Connection) -> Result<Vec<Task>, String> {
     let mut stmt = conn.prepare(
         "SELECT t.id,t.title,t.description,t.status,t.priority,t.due_at,t.category_id,c.name,c.color,
-                t.created_at,t.updated_at,t.completed_at,t.deleted_at
+                t.created_at,t.updated_at,t.completed_at,t.deleted_at,t.images_json,t.local_path,t.sms_reminder
          FROM tasks t LEFT JOIN categories c ON c.id=t.category_id"
     ).map_err(|e| e.to_string())?;
     let tasks = stmt.query_map([], row_to_task).map_err(|e| e.to_string())?
@@ -223,13 +273,20 @@ fn validate_input(input: &TaskInput) -> Result<(), String> {
     if input.description.chars().count() > 1000 { return Err("任务说明不能超过 1000 个字符".into()); }
     if !matches!(input.priority.as_str(), "low" | "medium" | "high") { return Err("无效的优先级".into()); }
     if let Some(value) = &input.due_at { DateTime::parse_from_rfc3339(value).map_err(|_| "截止时间格式无效".to_string())?; }
+    if input.images.len() > 6 { return Err("每项任务最多 6 张图片".into()); }
+    for image in &input.images {
+        if !image.data_url.starts_with("data:image/jpeg;base64,") || image.data_url.len() > 1024 * 1024 {
+            return Err("图片格式或大小无效".into());
+        }
+    }
+    if input.sms_reminder && input.due_at.is_none() { return Err("短信提醒需要截止时间".into()); }
     Ok(())
 }
 
 fn load_task(conn: &Connection, id: &str) -> Result<Task, String> {
     conn.query_row(
         "SELECT t.id,t.title,t.description,t.status,t.priority,t.due_at,t.category_id,c.name,c.color,
-                t.created_at,t.updated_at,t.completed_at,t.deleted_at
+                t.created_at,t.updated_at,t.completed_at,t.deleted_at,t.images_json,t.local_path,t.sms_reminder
          FROM tasks t LEFT JOIN categories c ON c.id=t.category_id WHERE t.id=?1",
         [id], row_to_task
     ).optional().map_err(|e| e.to_string())?.ok_or_else(|| "找不到任务".into())
@@ -237,6 +294,7 @@ fn load_task(conn: &Connection, id: &str) -> Result<Task, String> {
 
 #[tauri::command]
 pub fn task_list(filter: TaskFilter, state: State<'_, AppState>) -> Result<Vec<Task>, String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let now = Local::now();
     let today = now.date_naive();
@@ -248,7 +306,8 @@ pub fn task_list(filter: TaskFilter, state: State<'_, AppState>) -> Result<Vec<T
             "today" => active && task.due_at.as_deref().and_then(local_date) == Some(today),
             "inbox" => active && task.category_id.is_none(),
             "upcoming" => active && task.due_at.as_deref().and_then(local_date).is_some_and(|d| d > today && d <= next_week),
-            "all" => active,
+            "unfinished" => active,
+            "all" => task.deleted_at.is_none(),
             "completed" => task.deleted_at.is_none() && task.status == "completed",
             "trash" => task.deleted_at.is_some(),
             "category" => active && task.category_id == filter.category_id,
@@ -264,12 +323,13 @@ pub fn task_list(filter: TaskFilter, state: State<'_, AppState>) -> Result<Vec<T
 #[tauri::command]
 pub fn task_create(input: TaskInput, state: State<'_, AppState>) -> Result<Task, String> {
     validate_input(&input)?;
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO tasks(id,title,description,status,priority,due_at,category_id,created_at,updated_at) VALUES(?1,?2,?3,'todo',?4,?5,?6,?7,?7)",
-        params![id, input.title.trim(), input.description.trim(), input.priority, input.due_at, input.category_id, now]
+        "INSERT INTO tasks(id,title,description,status,priority,due_at,category_id,created_at,updated_at,images_json,local_path,sms_reminder) VALUES(?1,?2,?3,'todo',?4,?5,?6,?7,?7,?8,?9,?10)",
+        params![id, input.title.trim(), input.description.trim(), input.priority, input.due_at, input.category_id, now, serde_json::to_string(&input.images).map_err(|e| e.to_string())?, input.local_path, input.sms_reminder]
     ).map_err(|e| e.to_string())?;
     load_task(&conn, &id)
 }
@@ -277,10 +337,11 @@ pub fn task_create(input: TaskInput, state: State<'_, AppState>) -> Result<Task,
 #[tauri::command]
 pub fn task_update(task_id: String, input: TaskInput, state: State<'_, AppState>) -> Result<Task, String> {
     validate_input(&input)?;
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let changed = conn.execute(
-        "UPDATE tasks SET title=?2,description=?3,priority=?4,due_at=?5,category_id=?6,updated_at=?7 WHERE id=?1",
-        params![task_id, input.title.trim(), input.description.trim(), input.priority, input.due_at, input.category_id, Utc::now().to_rfc3339()]
+        "UPDATE tasks SET title=?2,description=?3,priority=?4,due_at=?5,category_id=?6,updated_at=?7,images_json=?8,local_path=?9,sms_reminder=?10 WHERE id=?1",
+        params![task_id, input.title.trim(), input.description.trim(), input.priority, input.due_at, input.category_id, Utc::now().to_rfc3339(), serde_json::to_string(&input.images).map_err(|e| e.to_string())?, input.local_path, input.sms_reminder]
     ).map_err(|e| e.to_string())?;
     if changed == 0 { return Err("找不到任务".into()); }
     load_task(&conn, &task_id)
@@ -288,6 +349,7 @@ pub fn task_update(task_id: String, input: TaskInput, state: State<'_, AppState>
 
 #[tauri::command]
 pub fn task_complete(task_id: String, completed: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let now = Utc::now().to_rfc3339();
     let changed = conn.execute(
@@ -299,6 +361,7 @@ pub fn task_complete(task_id: String, completed: bool, state: State<'_, AppState
 
 #[tauri::command]
 pub fn task_delete(task_id: String, permanent: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let changed = if permanent {
         conn.execute("DELETE FROM tasks WHERE id=?1 AND deleted_at IS NOT NULL", [&task_id])
@@ -310,6 +373,7 @@ pub fn task_delete(task_id: String, permanent: bool, state: State<'_, AppState>)
 
 #[tauri::command]
 pub fn task_restore(task_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let changed = conn.execute("UPDATE tasks SET deleted_at=NULL,updated_at=?2 WHERE id=?1", params![task_id, Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
     if changed == 0 { Err("找不到任务".into()) } else { Ok(()) }
@@ -317,6 +381,7 @@ pub fn task_restore(task_id: String, state: State<'_, AppState>) -> Result<(), S
 
 #[tauri::command]
 pub fn stats_get(state: State<'_, AppState>) -> Result<Stats, String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let now = Local::now();
     let today = now.date_naive();
@@ -324,12 +389,13 @@ pub fn stats_get(state: State<'_, AppState>) -> Result<Stats, String> {
     let mut stats = Stats::default();
     for task in all_tasks(&conn)? {
         if task.deleted_at.is_some() { stats.trash += 1; continue; }
+        stats.all += 1;
         if task.status == "completed" {
             stats.completed += 1;
             if task.completed_at.as_deref().and_then(local_date) == Some(today) { stats.completed_today += 1; }
             continue;
         }
-        stats.all += 1;
+        stats.unfinished += 1;
         if task.category_id.is_none() { stats.inbox += 1; }
         if let Some(due) = task.due_at.as_deref().and_then(local_time) {
             if due.date_naive() == today { stats.today += 1; }
@@ -342,6 +408,7 @@ pub fn stats_get(state: State<'_, AppState>) -> Result<Stats, String> {
 
 #[tauri::command]
 pub fn category_list(state: State<'_, AppState>) -> Result<Vec<Category>, String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let mut stmt = conn.prepare("SELECT id,name,color,sort_order FROM categories ORDER BY sort_order,name").map_err(|e| e.to_string())?;
     let categories = stmt.query_map([], |row| Ok(Category { id: row.get(0)?, name: row.get(1)?, color: row.get(2)?, sort_order: row.get(3)? }))
@@ -353,6 +420,7 @@ pub fn category_list(state: State<'_, AppState>) -> Result<Vec<Category>, String
 pub fn category_save(input: CategoryInput, state: State<'_, AppState>) -> Result<Category, String> {
     if input.name.trim().is_empty() { return Err("分类名称不能为空".into()); }
     if !input.color.starts_with('#') || input.color.len() != 7 { return Err("分类颜色格式无效".into()); }
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let id = input.id.unwrap_or_else(|| Uuid::new_v4().to_string());
     let sort_order = match input.sort_order {
@@ -371,6 +439,7 @@ pub fn category_save(input: CategoryInput, state: State<'_, AppState>) -> Result
 
 #[tauri::command]
 pub fn category_delete(category_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     conn.execute("DELETE FROM categories WHERE id=?1", [category_id]).map_err(|e| e.to_string())?;
     Ok(())
@@ -378,6 +447,7 @@ pub fn category_delete(category_id: String, state: State<'_, AppState>) -> Resul
 
 #[tauri::command]
 pub fn settings_get(state: State<'_, AppState>) -> Result<AppSettings, String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let value: Option<String> = conn.query_row("SELECT value FROM settings WHERE key='app'", [], |row| row.get(0)).optional().map_err(|e| e.to_string())?;
     value.map(|raw| serde_json::from_str(&raw).map_err(|e| e.to_string())).unwrap_or(Ok(AppSettings::default()))
@@ -391,22 +461,21 @@ pub fn daily_backup_enabled(path: &Path) -> Result<bool, String> {
 
 #[tauri::command]
 pub fn settings_save(settings: AppSettings, state: State<'_, AppState>) -> Result<(), String> {
+    crate::reminders::validate_settings(&settings)?;
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let value = serde_json::to_string(&settings).map_err(|e| e.to_string())?;
     conn.execute("INSERT INTO settings(key,value) VALUES('app',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [value]).map_err(|e| e.to_string())?;
     Ok(())
 }
 
-fn create_backup(db_path: &Path, backup_dir: &Path) -> Result<BackupInfo, String> {
+pub(crate) fn create_backup(db_path: &Path, backup_dir: &Path) -> Result<BackupInfo, String> {
     fs::create_dir_all(backup_dir).map_err(|e| e.to_string())?;
-    {
-        let conn = open(db_path)?;
-        conn.execute_batch("PRAGMA wal_checkpoint(FULL);").map_err(|e| e.to_string())?;
-    }
-    let stamp = Local::now().format("%Y-%m-%d_%H-%M-%S");
+    let stamp = Local::now().format("%Y-%m-%d_%H-%M-%S-%f");
     let name = format!("qingdan-backup-{stamp}.sqlite3");
     let target = backup_dir.join(&name);
-    fs::copy(db_path, &target).map_err(|e| e.to_string())?;
+    let conn = open(db_path)?;
+    conn.backup(DatabaseName::Main, &target, None).map_err(|e| e.to_string())?;
     let metadata = fs::metadata(&target).map_err(|e| e.to_string())?;
     Ok(BackupInfo { name, path: target.to_string_lossy().into(), created_at: Utc::now().to_rfc3339(), size: metadata.len() })
 }
@@ -421,6 +490,7 @@ pub fn create_daily_backup_if_needed(db_path: &Path, backup_dir: &Path) -> Resul
 
 #[tauri::command]
 pub fn backup_create(state: State<'_, AppState>) -> Result<BackupInfo, String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     create_backup(&state.db_path, &state.backup_dir)
 }
 
@@ -443,6 +513,7 @@ pub fn backup_list(state: State<'_, AppState>) -> Result<Vec<BackupInfo>, String
 
 #[tauri::command]
 pub fn backup_restore(path: String, state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let candidate = PathBuf::from(path).canonicalize().map_err(|e| e.to_string())?;
     let root = state.backup_dir.canonicalize().map_err(|e| e.to_string())?;
     if !candidate.starts_with(&root) || candidate.extension().and_then(|s| s.to_str()) != Some("sqlite3") {
@@ -451,23 +522,52 @@ pub fn backup_restore(path: String, state: State<'_, AppState>) -> Result<(), St
     let check = Connection::open(&candidate).map_err(|e| e.to_string())?;
     let integrity: String = check.query_row("PRAGMA quick_check", [], |row| row.get(0)).map_err(|e| e.to_string())?;
     if integrity != "ok" { return Err("备份文件校验失败".into()); }
+    check.prepare("SELECT id,title,description,status,priority,due_at,category_id,created_at,updated_at,completed_at,deleted_at FROM tasks LIMIT 0").map_err(|_| "备份不是兼容的清单数据库".to_string())?;
+    check.prepare("SELECT id,name,color,sort_order FROM categories LIMIT 0").map_err(|_| "备份缺少分类数据".to_string())?;
     drop(check);
     create_backup(&state.db_path, &state.backup_dir)?;
-    let temp = state.db_path.with_extension("restore.tmp");
-    fs::copy(&candidate, &temp).map_err(|e| e.to_string())?;
-    for suffix in ["-wal", "-shm"] {
-        let sidecar = PathBuf::from(format!("{}{}", state.db_path.display(), suffix));
-        if sidecar.exists() { fs::remove_file(sidecar).map_err(|e| e.to_string())?; }
-    }
-    fs::copy(&temp, &state.db_path).map_err(|e| e.to_string())?;
-    fs::remove_file(&temp).map_err(|e| e.to_string())?;
+    let mut conn = open(&state.db_path)?;
+    conn.restore(DatabaseName::Main, &candidate, None::<fn(rusqlite::backup::Progress)>).map_err(|e| e.to_string())?;
+    drop(conn);
     initialize(&state.db_path)
 }
 
 #[tauri::command]
 pub fn demo_reset(state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     conn.execute("UPDATE tasks SET deleted_at=?1", [Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+
+#[tauri::command]
+pub fn task_delete_many(task_ids: Vec<String>, permanent: bool, state: State<'_, AppState>) -> Result<(), String> {
+    let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
+    let mut conn = open(&state.db_path)?;
+    delete_many(&mut conn, &task_ids, permanent)
+}
+
+fn delete_many(conn: &mut Connection, task_ids: &[String], permanent: bool) -> Result<(), String> {
+    if task_ids.len() > 10000 { return Err("一次最多删除 10000 项".into()); }
+    let tx = conn.transaction().map_err(|e| e.to_string())?;
+    for id in task_ids.iter().collect::<std::collections::HashSet<_>>() {
+        let changed = if permanent {
+            tx.execute("DELETE FROM tasks WHERE id=?1 AND deleted_at IS NOT NULL", [id])
+        } else {
+            tx.execute("UPDATE tasks SET deleted_at=?2,updated_at=?2 WHERE id=?1 AND deleted_at IS NULL", params![id, Utc::now().to_rfc3339()])
+        }.map_err(|e| e.to_string())?;
+        if changed != 1 { return Err("任务不存在或状态已变化，请刷新后重试".into()); }
+    }
+    tx.commit().map_err(|e| e.to_string())
+}
+
+pub fn prepare_upgrade(db_path: &Path, backup_dir: &Path) -> Result<(), String> {
+    if !db_path.is_file() { return Ok(()); }
+    let conn = open(db_path)?;
+    let version: i64 = conn.query_row("SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |row| row.get(0)).unwrap_or(0);
+    drop(conn);
+    if version < 2 { create_backup(db_path, backup_dir)?; }
     Ok(())
 }
 
@@ -485,4 +585,87 @@ mod tests {
         drop(conn);
         let _ = fs::remove_file(path);
     }
+
+    #[test]
+    fn upgrade_keeps_v1_records_and_backups_original_schema() {
+        let root = std::env::temp_dir().join(format!("qingdan-upgrade-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("backups")).unwrap();
+        let path = root.join("qingdan.sqlite3");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch("CREATE TABLE categories(id TEXT PRIMARY KEY,name TEXT UNIQUE,color TEXT,sort_order INTEGER,created_at TEXT);
+            CREATE TABLE tasks(id TEXT PRIMARY KEY,title TEXT,description TEXT,status TEXT,priority TEXT,due_at TEXT,category_id TEXT,created_at TEXT,updated_at TEXT,completed_at TEXT,deleted_at TEXT);
+            CREATE TABLE settings(key TEXT PRIMARY KEY,value TEXT);
+            CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY,applied_at TEXT);
+            INSERT INTO schema_migrations VALUES(1,'2026-10-16');
+            INSERT INTO categories VALUES('personal','我的项目','#123456',0,'2026-10-16');
+            INSERT INTO tasks VALUES('keep','旧任务','完成了一半','todo','high',NULL,'personal','created','updated',NULL,NULL);
+            INSERT INTO tasks VALUES('done','已完成的旧任务','','completed','low',NULL,NULL,'created','updated','completed',NULL);
+            INSERT INTO tasks VALUES('trash','回收站旧任务','','todo','medium',NULL,NULL,'created','updated',NULL,'deleted');").unwrap();
+        drop(conn);
+        prepare_upgrade(&path, &root.join("backups")).unwrap();
+        let backup = fs::read_dir(root.join("backups")).unwrap().next().unwrap().unwrap().path();
+        let old = Connection::open(backup).unwrap();
+        assert_eq!(old.query_row("SELECT MAX(version) FROM schema_migrations", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        drop(old);
+        initialize(&path).unwrap();
+        initialize(&path).unwrap();
+        let conn = open(&path).unwrap();
+        let tasks = all_tasks(&conn).unwrap();
+        assert_eq!(tasks.len(), 3);
+        let keep = tasks.iter().find(|task| task.id == "keep").unwrap();
+        assert_eq!(keep.title, "旧任务");
+        assert_eq!(keep.category_id.as_deref(), Some("personal"));
+        assert!(keep.images.is_empty());
+        assert!(!keep.sms_reminder);
+        assert_eq!(tasks.iter().filter(|t| t.status == "completed").count(), 1);
+        assert_eq!(tasks.iter().filter(|t| t.deleted_at.is_some()).count(), 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM categories", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn batch_delete_rolls_back_and_backups_include_attachments() {
+        let root = std::env::temp_dir().join(format!("qingdan-batch-{}", Uuid::new_v4()));
+        fs::create_dir_all(root.join("backups")).unwrap();
+        let path = root.join("qingdan.sqlite3");
+        initialize(&path).unwrap();
+        let mut conn = open(&path).unwrap();
+        let id = all_tasks(&conn).unwrap()[0].id.clone();
+        let images = r#"[{"id":"img","name":"快照.jpg","dataUrl":"data:image/jpeg;base64,aA==","createdAt":"2026-10-19"}]"#;
+        conn.execute("UPDATE tasks SET images_json=?2,local_path=?3,sms_reminder=1 WHERE id=?1", params![id, images, r"D:\项目资料"]).unwrap();
+        assert!(delete_many(&mut conn, &[id.clone(), "missing".into()], false).is_err());
+        assert!(load_task(&conn, &id).unwrap().deleted_at.is_none());
+        assert!(delete_many(&mut conn, &[id.clone()], true).is_err());
+        delete_many(&mut conn, &[id.clone()], false).unwrap();
+        let backup = create_backup(&path, &root.join("backups")).unwrap();
+        delete_many(&mut conn, &[id.clone()], true).unwrap();
+        assert!(load_task(&conn, &id).is_err());
+        conn.restore(DatabaseName::Main, &backup.path, None::<fn(rusqlite::backup::Progress)>).unwrap();
+        let restored = load_task(&conn, &id).unwrap();
+        assert_eq!(restored.images[0].name, "快照.jpg");
+        assert_eq!(restored.local_path.as_deref(), Some(r"D:\项目资料"));
+        assert!(restored.sms_reminder);
+        assert!(restored.deleted_at.is_some());
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn deleted_all_categories_are_not_reseeded_on_upgrade() {
+        let path = std::env::temp_dir().join(format!("qingdan-empty-{}.sqlite3", Uuid::new_v4()));
+        initialize(&path).unwrap();
+        let conn = open(&path).unwrap();
+        conn.execute("DELETE FROM tasks", []).unwrap();
+        conn.execute("DELETE FROM categories", []).unwrap();
+        drop(conn);
+        initialize(&path).unwrap();
+        let conn = open(&path).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM categories", [], |r| r.get::<_, i64>(0)).unwrap(), 0);
+        assert!(all_tasks(&conn).unwrap().is_empty());
+        drop(conn);
+        let _ = fs::remove_file(path);
+    }
+
 }
+

@@ -1,11 +1,12 @@
 <script setup lang="ts">
 import { computed, onMounted, ref, watch } from 'vue'
 import { api } from './services'
+import { MAX_IMAGES, prepareImage } from './images'
 import type { AppSettings, BackupInfo, Category, Priority, Stats, Task, TaskInput, ViewKey } from './types'
 
 const tasks = ref<Task[]>([])
 const categories = ref<Category[]>([])
-const stats = ref<Stats>({ today: 0, inbox: 0, upcoming: 0, all: 0, completed: 0, trash: 0, overdue: 0, completedToday: 0 })
+const stats = ref<Stats>({ today: 0, inbox: 0, upcoming: 0, all: 0, unfinished: 0, completed: 0, trash: 0, overdue: 0, completedToday: 0 })
 const settings = ref<AppSettings>({ startView: 'today', theme: 'light', dailyBackup: true })
 const activeView = ref<ViewKey | 'category'>('today')
 const activeCategoryId = ref<string | null>(null)
@@ -19,6 +20,14 @@ const backupOpen = ref(false)
 const editingTaskId = ref<string | null>(null)
 const backups = ref<BackupInfo[]>([])
 const toast = ref('')
+const batchMode = ref(false)
+const batchIds = ref<string[]>([])
+const busy = ref(false)
+const processingImages = ref(false)
+const previewImage = ref<string | null>(null)
+const smsStatus = ref('')
+const allChecked = computed(() => tasks.value.length > 0 && tasks.value.every(task => batchIds.value.includes(task.id)))
+
 const categoryDraft = ref({ id: '', name: '', color: '#5B8FF9' })
 const form = ref<TaskInput>({ title: '', description: '', priority: 'medium', dueAt: null, categoryId: null })
 
@@ -26,6 +35,7 @@ const navItems: { key: ViewKey; label: string; icon: string; count: keyof Stats 
   { key: 'today', label: '今日任务', icon: '☀', count: 'today' },
   { key: 'inbox', label: '收集箱', icon: '▣', count: 'inbox' },
   { key: 'upcoming', label: '即将到期', icon: '◷', count: 'upcoming' },
+  { key: 'unfinished', label: '未完成', icon: '☐', count: 'unfinished' },
   { key: 'all', label: '全部任务', icon: '☷', count: 'all' },
   { key: 'completed', label: '已完成', icon: '✓', count: 'completed' },
   { key: 'trash', label: '回收站', icon: '♲', count: 'trash' }
@@ -93,6 +103,7 @@ async function refresh() {
       api.listCategories()
     ])
     tasks.value = nextTasks
+    batchIds.value = batchIds.value.filter(id => nextTasks.some(task => task.id === id))
     stats.value = nextStats
     categories.value = nextCategories
     if (!nextTasks.some(item => item.id === selectedId.value)) selectedId.value = nextTasks[0]?.id ?? null
@@ -104,35 +115,46 @@ async function refresh() {
 }
 
 function changeView(view: ViewKey) {
+  batchMode.value = false
+  batchIds.value = []
   activeView.value = view
   activeCategoryId.value = null
 }
 
 function changeCategory(categoryId: string) {
+  batchMode.value = false
+  batchIds.value = []
   activeView.value = 'category'
   activeCategoryId.value = categoryId
 }
 
 function openCreate() {
   editingTaskId.value = null
-  form.value = { title: '', description: '', priority: 'medium', dueAt: activeView.value === 'today' ? new Date(new Date().setHours(18, 0, 0, 0)).toISOString() : null, categoryId: activeView.value === 'category' ? activeCategoryId.value : null }
+  form.value = { title: '', description: '', priority: 'medium', dueAt: activeView.value === 'today' ? new Date(new Date().setHours(18, 0, 0, 0)).toISOString() : null, categoryId: activeView.value === 'category' ? activeCategoryId.value : null, images: [], localPath: null, smsReminder: false }
   editorOpen.value = true
 }
 
 function openEdit(task: Task) {
   editingTaskId.value = task.id
-  form.value = { title: task.title, description: task.description, priority: task.priority, dueAt: task.dueAt, categoryId: task.categoryId }
+  form.value = { title: task.title, description: task.description, priority: task.priority, dueAt: task.dueAt, categoryId: task.categoryId, images: (task.images ?? []).map(image => ({ ...image })), localPath: task.localPath ?? null, smsReminder: task.smsReminder ?? false }
   editorOpen.value = true
 }
 
 async function submitTask() {
   if (!form.value.title.trim()) return flash('请输入任务名称')
-  const input = { ...form.value, title: form.value.title.trim(), description: form.value.description.trim() }
-  if (editingTaskId.value) await api.updateTask(editingTaskId.value, input)
-  else await api.createTask(input)
-  editorOpen.value = false
-  flash(editingTaskId.value ? '任务已更新' : '任务已创建')
-  await refresh()
+  if (busy.value || processingImages.value) return
+  if (form.value.smsReminder && !form.value.dueAt) return flash('短信提醒需要设置截止时间')
+  if (form.value.smsReminder && (!api.desktop || !settings.value.smsEnabled)) return flash('请先在桌面版设置中启用短信服务')
+  busy.value = true
+  try {
+    const input = { ...form.value, title: form.value.title.trim(), description: form.value.description.trim(), localPath: form.value.localPath?.trim() || null }
+    if (editingTaskId.value) await api.updateTask(editingTaskId.value, input)
+    else await api.createTask(input)
+    editorOpen.value = false
+    flash(editingTaskId.value ? '任务已更新' : '任务已创建')
+    await refresh()
+  } catch (error) { flash(`保存失败：${String(error)}`) }
+  finally { busy.value = false }
 }
 
 async function toggleTask(task: Task) {
@@ -147,6 +169,66 @@ async function removeTask(task: Task) {
   await api.deleteTask(task.id, permanent)
   flash(permanent ? '任务已永久删除' : '任务已移入回收站')
   await refresh()
+}
+
+function toggleBatch(id: string) {
+  batchIds.value = batchIds.value.includes(id) ? batchIds.value.filter(value => value !== id) : [...batchIds.value, id]
+}
+
+async function deleteBatch() {
+  const ids = [...batchIds.value]
+  if (!ids.length || busy.value) return
+  const permanent = activeView.value === 'trash'
+  if (!confirm(permanent ? `永久删除选中的 ${ids.length} 项任务？无法撤销。` : `将选中的 ${ids.length} 项任务移入回收站？`)) return
+  busy.value = true
+  try {
+    await api.deleteTasks(ids, permanent)
+    batchIds.value = []
+    flash(permanent ? '选中任务已永久删除' : '选中任务已移入回收站')
+    await refresh()
+  } catch (error) { flash(`批量删除失败：${String(error)}`) }
+  finally { busy.value = false }
+}
+
+async function addImages(files: File[]) {
+  if (processingImages.value) return
+  const room = MAX_IMAGES - (form.value.images?.length ?? 0)
+  if (room < 1) return flash(`每项任务最多 ${MAX_IMAGES} 张图片`)
+  processingImages.value = true
+  try {
+    for (const file of files.slice(0, room)) {
+      const image = await prepareImage(file)
+      form.value.images = [...(form.value.images ?? []), image]
+    }
+    if (files.length > room) flash(`每项任务最多 ${MAX_IMAGES} 张图片`)
+  } catch (error) { flash(String(error)) }
+  finally { processingImages.value = false }
+}
+
+function pasteImage(event: ClipboardEvent) {
+  const files = Array.from(event.clipboardData?.files ?? []).filter(file => file.type.startsWith('image/'))
+  if (files.length) { event.preventDefault(); void addImages(files) }
+}
+
+function uploadImages(event: Event) {
+  const input = event.target as HTMLInputElement
+  void addImages(Array.from(input.files ?? []))
+  input.value = ''
+}
+
+async function pickDirectory() {
+  try { const path = await api.pickDirectory(); if (path) form.value.localPath = path }
+  catch (error) { flash(String(error)) }
+}
+
+async function openDirectory(path: string) {
+  try { await api.openDirectory(path) } catch (error) { flash(String(error)) }
+}
+
+async function openSettings() {
+  settings.value = await api.getSettings()
+  smsStatus.value = await api.smsStatus()
+  settingsOpen.value = true
 }
 
 async function restoreTask(task: Task) {
@@ -199,9 +281,11 @@ async function restoreBackup(backup: BackupInfo) {
 }
 
 async function saveSettings() {
-  await api.saveSettings(settings.value)
-  settingsOpen.value = false
-  flash('设置已保存')
+  try {
+    await api.saveSettings(settings.value)
+    settingsOpen.value = false
+    flash('设置已保存')
+  } catch (error) { flash(`设置保存失败：${String(error)}`) }
 }
 
 let debounce: number | undefined
@@ -231,7 +315,7 @@ onMounted(async () => {
       <div class="top-actions">
         <span class="local-badge"><i></i>{{ api.desktop ? 'SQLite 本地存储' : api.portable ? 'D盘本地存储' : '浏览器本地预览' }}</span>
         <button class="icon-button" title="备份" @click="openBackups">↧</button>
-        <button class="icon-button" title="设置" @click="settingsOpen = true">⚙</button>
+        <button class="icon-button" title="设置" @click="openSettings">⚙</button>
       </div>
     </header>
 
@@ -250,7 +334,7 @@ onMounted(async () => {
       </nav>
       <div class="privacy-card">
         <span>⌂</span>
-        <div><strong>数据只在此设备</strong><p>不上传云端，隐私更安心</p></div>
+        <div><strong>数据只在此设备</strong><p>{{ settings.smsEnabled ? '短信启用时会发送提醒内容' : '不上传云端，隐私更安心' }}</p></div>
       </div>
     </aside>
 
@@ -269,12 +353,20 @@ onMounted(async () => {
 
         <div class="list-toolbar">
           <span>{{ tasks.length }} 项</span>
+          <button class="plain-button batch-entry" @click="batchMode = !batchMode; batchIds = []">{{ batchMode ? '取消多选' : '批量删除' }}</button>
           <span v-if="stats.overdue && activeView !== 'trash'" class="overdue-summary">{{ stats.overdue }} 项已逾期</span>
         </div>
 
+        <div v-if="batchMode" class="batch-toolbar">
+          <label><input type="checkbox" :checked="allChecked" @change="batchIds = allChecked ? [] : tasks.map(task => task.id)" /> 全选当前结果</label>
+          <span>已选 {{ batchIds.length }} 项</span>
+          <button class="danger-button" :disabled="!batchIds.length || busy" @click="deleteBatch">{{ activeView === 'trash' ? '永久删除选中' : '删除选中' }}</button>
+        </div>
+
         <div class="task-list" :class="{ loading }">
-          <article v-for="task in tasks" :key="task.id" class="task-row" :class="{ selected: selectedId === task.id, done: task.status === 'completed' }" @click="selectedId = task.id">
-            <button v-if="activeView !== 'trash'" class="check" :class="{ checked: task.status === 'completed' }" :aria-label="task.status === 'completed' ? '恢复任务' : '完成任务'" @click.stop="toggleTask(task)">{{ task.status === 'completed' ? '✓' : '' }}</button>
+          <article v-for="task in tasks" :key="task.id" class="task-row" :class="[`priority-${task.priority}`, { selected: selectedId === task.id, done: task.status === 'completed' }]" @click="batchMode ? toggleBatch(task.id) : selectedId = task.id">
+            <input v-if="batchMode" class="batch-check" type="checkbox" :aria-label="`选择 ${task.title}`" :checked="batchIds.includes(task.id)" @click.stop @change="toggleBatch(task.id)" />
+            <button v-else-if="activeView !== 'trash'" class="check" :class="{ checked: task.status === 'completed' }" :aria-label="task.status === 'completed' ? '恢复任务' : '完成任务'" @click.stop="toggleTask(task)">{{ task.status === 'completed' ? '✓' : '' }}</button>
             <span v-else class="trash-dot">♲</span>
             <div class="task-copy">
               <strong>{{ task.title }}</strong>
@@ -282,10 +374,13 @@ onMounted(async () => {
               <div class="task-meta">
                 <span v-if="task.categoryName" class="category-tag"><i :style="{ background: task.categoryColor ?? '#999' }"></i>{{ task.categoryName }}</span>
                 <span v-if="task.dueAt" :class="{ overdue: isOverdue(task) }">◷ {{ dueLabel(task.dueAt) }}</span>
+                <span v-if="task.images?.length">▧ {{ task.images.length }}</span>
+                <span v-if="task.localPath">▱ 文件夹</span>
+                <span v-if="task.smsReminder">短信提醒</span>
                 <span :class="`priority ${task.priority}`">◆ {{ priorityLabel(task.priority) }}</span>
               </div>
             </div>
-            <div class="row-actions">
+            <div v-if="!batchMode" class="row-actions">
               <button v-if="activeView === 'trash'" title="恢复" @click.stop="restoreTask(task)">↶</button>
               <button v-else title="编辑" @click.stop="openEdit(task)">✎</button>
               <button title="删除" @click.stop="removeTask(task)">×</button>
@@ -311,6 +406,11 @@ onMounted(async () => {
               <div><dt>优先级</dt><dd>{{ priorityLabel(selectedTask.priority) }}</dd></div>
               <div><dt>分类</dt><dd>{{ selectedTask.categoryName || '收集箱' }}</dd></div>
             </dl>
+            <div v-if="selectedTask.images?.length" class="image-grid detail-images">
+              <button v-for="image in selectedTask.images" :key="image.id" :title="image.name" @click="previewImage = image.dataUrl"><img :src="image.dataUrl" :alt="image.name" /></button>
+            </div>
+            <button v-if="selectedTask.localPath" class="directory-link" :title="selectedTask.localPath" @click="openDirectory(selectedTask.localPath)">▱ 打开本地文件夹<br /><small>{{ selectedTask.localPath }}</small></button>
+            <p v-if="selectedTask.smsReminder" class="helper">已开启截止时短信提醒，需保持桌面应用运行。</p>
             <button v-if="activeView !== 'trash'" class="primary-wide" @click="openEdit(selectedTask)">编辑任务</button>
             <button v-if="selectedTask.status !== 'completed' && activeView !== 'trash'" class="ghost-wide" @click="toggleTask(selectedTask)">标记为已完成</button>
             <button v-if="activeView === 'trash'" class="primary-wide" @click="restoreTask(selectedTask)">恢复任务</button>
@@ -322,7 +422,7 @@ onMounted(async () => {
     </main>
 
     <div v-if="editorOpen" class="modal-backdrop" @click.self="editorOpen = false">
-      <form class="modal task-editor" @submit.prevent="submitTask">
+      <form class="modal task-editor" @submit.prevent="submitTask" @paste="pasteImage">
         <div class="modal-head"><div><small>{{ editingTaskId ? '编辑任务' : '新建任务' }}</small><h2>{{ editingTaskId ? '完善任务内容' : '记录要做的事情' }}</h2></div><button type="button" @click="editorOpen = false">×</button></div>
         <label><span>任务名称 *</span><input v-model="form.title" autofocus maxlength="120" placeholder="例如：完成项目周报" /></label>
         <label><span>任务说明</span><textarea v-model="form.description" rows="4" maxlength="1000" placeholder="补充一些细节…"></textarea></label>
@@ -331,7 +431,17 @@ onMounted(async () => {
           <label><span>分类</span><select v-model="form.categoryId"><option :value="null">收集箱</option><option v-for="category in categories" :key="category.id" :value="category.id">{{ category.name }}</option></select></label>
         </div>
         <label><span>优先级</span><div class="priority-picker"><button v-for="item in (['low','medium','high'] as Priority[])" :key="item" type="button" :class="[item, { active: form.priority === item }]" @click="form.priority = item">{{ priorityLabel(item) }}</button></div></label>
-        <div class="modal-actions"><button type="button" class="plain-button" @click="editorOpen = false">取消</button><button class="primary-button">{{ editingTaskId ? '保存更改' : '创建任务' }}</button></div>
+        <section class="attachment-section">
+          <strong>图片 / 进度快照</strong>
+          <p class="helper">记录做到一半的状态：上传图片，或截图后在此窗口按 Ctrl+V。最多 6 张，自动压缩保存。</p>
+          <label class="upload-button">{{ processingImages ? '正在处理…' : '＋ 添加图片' }}<input type="file" accept="image/png,image/jpeg,image/webp,image/gif,image/bmp" multiple :disabled="processingImages" @change="uploadImages" /></label>
+          <div class="image-grid">
+            <div v-for="image in form.images" :key="image.id"><button type="button" @click="previewImage = image.dataUrl"><img :src="image.dataUrl" :alt="image.name" /></button><button type="button" class="remove-image" :aria-label="`移除 ${image.name}`" @click="form.images = form.images?.filter(item => item.id !== image.id)">×</button></div>
+          </div>
+        </section>
+        <label><span>关联本地文件夹</span><div class="path-input"><input v-model="form.localPath" placeholder="例如 D:\项目资料" /><button v-if="api.desktop" type="button" class="plain-button" @click="pickDirectory">选择目录</button></div></label>
+        <label class="switch-row"><div><strong>截止时短信提醒</strong><small>{{ api.desktop ? '先在设置中配置短信服务；应用关闭时无法发送' : '需要 Windows 桌面版配置短信服务' }}</small></div><input v-model="form.smsReminder" type="checkbox" :disabled="!api.desktop || !settings.smsEnabled" /></label>
+        <div class="modal-actions"><button type="button" class="plain-button" @click="editorOpen = false">取消</button><button class="primary-button" :disabled="busy || processingImages">{{ editingTaskId ? '保存更改' : '创建任务' }}</button></div>
       </form>
     </div>
 
@@ -348,9 +458,18 @@ onMounted(async () => {
     <div v-if="settingsOpen" class="modal-backdrop" @click.self="settingsOpen = false">
       <section class="modal small-modal">
         <div class="modal-head"><div><small>偏好设置</small><h2>应用设置</h2></div><button @click="settingsOpen = false">×</button></div>
-        <label><span>启动时打开</span><select v-model="settings.startView"><option value="today">今日任务</option><option value="inbox">收集箱</option><option value="upcoming">即将到期</option><option value="all">全部任务</option></select></label>
+        <label><span>启动时打开</span><select v-model="settings.startView"><option value="today">今日任务</option><option value="inbox">收集箱</option><option value="upcoming">即将到期</option><option value="unfinished">未完成</option><option value="all">全部任务</option></select></label>
         <label class="switch-row"><div><strong>每日自动备份</strong><small>桌面版每天首次启动时创建本地备份</small></div><input v-model="settings.dailyBackup" type="checkbox" /></label>
-        <div class="about-card"><strong>清单 v1.0.0</strong><span>离线优先 · 本地存储 · 无需账号</span></div>
+        <section class="sms-settings">
+          <label class="switch-row"><div><strong>手机短信服务</strong><small>仅桌面版；按任务勾选，截止后每 30 秒检查</small></div><input v-model="settings.smsEnabled" type="checkbox" :disabled="!api.desktop" /></label>
+          <template v-if="api.desktop">
+            <label><span>接收手机号（国际格式）</span><input v-model="settings.smsPhone" type="tel" placeholder="+8613800000000" /></label>
+            <label><span>短信中转服务 HTTPS 地址</span><input v-model="settings.smsWebhookUrl" type="url" placeholder="https://你的服务地址/reminders" /></label>
+            <p class="helper">服务密钥通过电脑环境变量 QINGDAN_SMS_TOKEN 配置，修改后重启应用。短信可能产生费用，仅向填写的手机号发送任务标题和截止时间。</p>
+          </template>
+          <p class="helper" role="status">{{ smsStatus }}</p>
+        </section>
+        <div class="about-card"><strong>清单 v1.1.0</strong><span>离线优先 · 本地存储 · 无需账号</span></div>
         <div class="modal-actions"><button class="plain-button" @click="settingsOpen = false">取消</button><button class="primary-button" @click="saveSettings">保存设置</button></div>
       </section>
     </div>
@@ -363,6 +482,8 @@ onMounted(async () => {
       </section>
     </div>
 
+    <div v-if="previewImage" class="image-preview" role="dialog" aria-label="图片预览" @click.self="previewImage = null"><button aria-label="关闭图片预览" @click="previewImage = null">×</button><img :src="previewImage" alt="任务图片大图" /></div>
     <transition name="toast"><div v-if="toast" class="toast">✓ {{ toast }}</div></transition>
   </div>
 </template>
+
