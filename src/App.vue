@@ -144,7 +144,6 @@ async function submitTask() {
   if (!form.value.title.trim()) return flash('请输入任务名称')
   if (busy.value || processingImages.value) return
   if (form.value.smsReminder && !form.value.dueAt) return flash('短信提醒需要设置截止时间')
-  if (form.value.smsReminder && (!api.desktop || !settings.value.smsEnabled)) return flash('请先在桌面版设置中启用短信服务')
   busy.value = true
   try {
     const input = { ...form.value, title: form.value.title.trim(), description: form.value.description.trim(), localPath: form.value.localPath?.trim() || null }
@@ -192,13 +191,14 @@ async function deleteBatch() {
 
 async function addImages(files: File[]) {
   if (processingImages.value) return
-  const room = MAX_IMAGES - (form.value.images?.length ?? 0)
+  const draft = form.value
+  const room = MAX_IMAGES - (draft.images?.length ?? 0)
   if (room < 1) return flash(`每项任务最多 ${MAX_IMAGES} 张图片`)
   processingImages.value = true
   try {
     for (const file of files.slice(0, room)) {
       const image = await prepareImage(file)
-      form.value.images = [...(form.value.images ?? []), image]
+      draft.images = [...(draft.images ?? []), image]
     }
     if (files.length > room) flash(`每项任务最多 ${MAX_IMAGES} 张图片`)
   } catch (error) { flash(String(error)) }
@@ -410,7 +410,7 @@ onMounted(async () => {
               <button v-for="image in selectedTask.images" :key="image.id" :title="image.name" @click="previewImage = image.dataUrl"><img :src="image.dataUrl" :alt="image.name" /></button>
             </div>
             <button v-if="selectedTask.localPath" class="directory-link" :title="selectedTask.localPath" @click="openDirectory(selectedTask.localPath)">▱ 打开本地文件夹<br /><small>{{ selectedTask.localPath }}</small></button>
-            <p v-if="selectedTask.smsReminder" class="helper">已开启截止时短信提醒，需保持桌面应用运行。</p>
+            <p v-if="selectedTask.smsReminder" class="helper">{{ settings.smsEnabled ? '截止时短信提醒已勾选，需保持桌面应用运行。' : '任务已勾选短信提醒，请先在设置中启用短信服务。' }}</p>
             <button v-if="activeView !== 'trash'" class="primary-wide" @click="openEdit(selectedTask)">编辑任务</button>
             <button v-if="selectedTask.status !== 'completed' && activeView !== 'trash'" class="ghost-wide" @click="toggleTask(selectedTask)">标记为已完成</button>
             <button v-if="activeView === 'trash'" class="primary-wide" @click="restoreTask(selectedTask)">恢复任务</button>
@@ -440,7 +440,7 @@ onMounted(async () => {
           </div>
         </section>
         <label><span>关联本地文件夹</span><div class="path-input"><input v-model="form.localPath" placeholder="例如 D:\项目资料" /><button v-if="api.desktop" type="button" class="plain-button" @click="pickDirectory">选择目录</button></div></label>
-        <label class="switch-row"><div><strong>截止时短信提醒</strong><small>{{ api.desktop ? '先在设置中配置短信服务；应用关闭时无法发送' : '需要 Windows 桌面版配置短信服务' }}</small></div><input v-model="form.smsReminder" type="checkbox" :disabled="!api.desktop || !settings.smsEnabled" /></label>
+        <label class="switch-row"><div><strong>截止时短信提醒</strong><small>{{ api.desktop ? '需在设置中启用短信服务才会发送；应用关闭时无法发送' : '需要 Windows 桌面版配置短信服务' }}</small></div><input v-model="form.smsReminder" type="checkbox" :disabled="!api.desktop" /></label>
         <div class="modal-actions"><button type="button" class="plain-button" @click="editorOpen = false">取消</button><button class="primary-button" :disabled="busy || processingImages">{{ editingTaskId ? '保存更改' : '创建任务' }}</button></div>
       </form>
     </div>

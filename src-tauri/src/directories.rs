@@ -24,10 +24,10 @@ pub fn directory_open(path: String) -> Result<(), String> {
     let mut command = Command::new("xdg-open");
     #[cfg(target_os = "windows")]
     let folder = {
-        let value = folder.to_string_lossy();
+        let value = folder.to_string_lossy().into_owned();
         if let Some(unc) = value.strip_prefix(r"\\?\UNC\") { PathBuf::from(format!(r"\\{}", unc)) }
         else if let Some(local) = value.strip_prefix(r"\\?\") { PathBuf::from(local) }
-        else { folder }
+        else { PathBuf::from(value) }
     };
     command.arg(folder).spawn().map_err(|_| "无法打开资源管理器".to_string())?;
     Ok(())
