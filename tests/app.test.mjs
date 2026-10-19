@@ -8,7 +8,7 @@ test('old data, filters, selection deletion and attachment backup round-trip', a
   await mkdir(directory, { recursive: true })
   await writeFile(new URL('entry.ts', directory), "export { default as App } from '../src/App.vue'; export { api } from '../src/services'; export { tasksCsv, tasksJson } from '../src/export';")
   const window = new Window({ url: 'http://localhost:1420' })
-  for (const key of ['window', 'document', 'localStorage', 'HTMLElement', 'Element', 'SVGElement', 'Node', 'Event', 'MouseEvent', 'location']) {
+  for (const key of ['window', 'document', 'localStorage', 'HTMLElement', 'Element', 'Document', 'ShadowRoot', 'SVGElement', 'Node', 'Event', 'MouseEvent', 'location']) {
     Object.defineProperty(globalThis, key, { value: key === 'window' ? window : window[key], configurable: true })
   }
   globalThis.requestAnimationFrame = window.requestAnimationFrame.bind(window)
@@ -118,6 +118,36 @@ test('old data, filters, selection deletion and attachment backup round-trip', a
     assert.ok(container.textContent.includes('QQ 邮箱提醒'))
     assert.ok(!container.textContent.includes('手机短信服务'))
     assert.ok(container.querySelector('input[type="password"]').disabled)
+    // Exercise the desktop configuration UI with a fake sender; no credentials or emails leave this test.
+    container.querySelector('.small-modal .modal-head button').click()
+    await flush()
+    api.desktop = true
+    let savedCode = null
+    let tested = 0
+    api.emailStatus = async () => ({ configured: Boolean(savedCode), sent: 0, failed: 0, uncertain: 0, lastError: null })
+    api.saveEmailCode = async (address, code) => { savedCode = { address, code } }
+    api.testEmail = async () => { tested++; return '测试服务已受理' }
+    container.querySelector('button[title="设置"]').click()
+    await flush()
+    const addressInput = container.querySelector('input[type="email"]')
+    addressInput.value = '123456@qq.com'
+    addressInput.dispatchEvent(new window.Event('input', { bubbles: true }))
+    const secret = 'unitTESTcodeONLY1'
+    const passwordInput = container.querySelector('input[type="password"]')
+    passwordInput.value = secret
+    passwordInput.dispatchEvent(new window.Event('input', { bubbles: true }))
+    const enableMail = container.querySelector('.email-settings input[type="checkbox"]')
+    enableMail.checked = true
+    enableMail.dispatchEvent(new window.Event('change', { bubbles: true }))
+    await flush()
+    await click('保存并发送测试邮件')
+    assert.equal(tested, 1)
+    assert.deepEqual(savedCode, { address: '123456@qq.com', code: secret })
+    assert.equal(container.querySelector('input[type="password"]').value, '')
+    assert.ok(!localStorage.getItem('qingdan.settings.v1').includes(secret))
+    assert.ok(!tasksJson([restored]).includes(secret))
+    api.desktop = false
+
 
   } finally {
     app.unmount()
