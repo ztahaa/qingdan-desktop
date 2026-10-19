@@ -61,6 +61,8 @@ pub struct Task {
     images: Vec<TaskImage>,
     local_path: Option<String>,
     sms_reminder: bool,
+    #[serde(default)]
+    email_reminder: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -76,6 +78,8 @@ pub struct TaskInput {
     local_path: Option<String>,
     #[serde(default)]
     sms_reminder: bool,
+    #[serde(default)]
+    email_reminder: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -112,6 +116,10 @@ pub struct AppSettings {
     pub sms_phone: String,
     #[serde(default)]
     pub sms_webhook_url: String,
+    #[serde(default)]
+    pub email_enabled: bool,
+    #[serde(default)]
+    pub email_address: String,
 }
 
 impl Default for AppSettings {
@@ -123,6 +131,8 @@ impl Default for AppSettings {
             sms_enabled: false,
             sms_phone: String::new(),
             sms_webhook_url: String::new(),
+            email_enabled: false,
+            email_address: String::new(),
         }
     }
 }
@@ -193,6 +203,7 @@ pub fn initialize(path: &Path) -> Result<(), String> {
         ("images_json", "ALTER TABLE tasks ADD COLUMN images_json TEXT NOT NULL DEFAULT '[]'"),
         ("local_path", "ALTER TABLE tasks ADD COLUMN local_path TEXT"),
         ("sms_reminder", "ALTER TABLE tasks ADD COLUMN sms_reminder INTEGER NOT NULL DEFAULT 0"),
+        ("email_reminder", "ALTER TABLE tasks ADD COLUMN email_reminder INTEGER NOT NULL DEFAULT 0"),
     ] {
         if !columns.iter().any(|column| column == name) {
             tx.execute_batch(sql).map_err(|e| e.to_string())?;
@@ -201,6 +212,12 @@ pub fn initialize(path: &Path) -> Result<(), String> {
     tx.execute_batch("CREATE TABLE IF NOT EXISTS sms_deliveries (
         delivery_key TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
         sent_at TEXT, next_attempt TEXT NOT NULL, last_error TEXT
+    );").map_err(|e| e.to_string())?;
+
+    tx.execute_batch("CREATE TABLE IF NOT EXISTS email_deliveries (
+        delivery_key TEXT PRIMARY KEY, task_id TEXT NOT NULL, recipient TEXT NOT NULL,
+        state TEXT NOT NULL DEFAULT 'pending', attempts INTEGER NOT NULL DEFAULT 0,
+        next_attempt TEXT NOT NULL, sent_at TEXT, last_error TEXT, message_id TEXT NOT NULL
     );").map_err(|e| e.to_string())?;
 
     let migration_count: i64 = tx.query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| row.get(0)).map_err(|e| e.to_string())?;
@@ -235,6 +252,7 @@ pub fn initialize(path: &Path) -> Result<(), String> {
     }
     tx.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(1,?1)", [Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
     tx.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(2,?1)", [Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
+    tx.execute("INSERT OR IGNORE INTO schema_migrations(version,applied_at) VALUES(3,?1)", [Utc::now().to_rfc3339()]).map_err(|e| e.to_string())?;
     tx.commit().map_err(|e| e.to_string())
 }
 
@@ -244,14 +262,14 @@ fn row_to_task(row: &Row<'_>) -> rusqlite::Result<Task> {
         due_at: row.get(5)?, category_id: row.get(6)?, category_name: row.get(7)?, category_color: row.get(8)?,
         created_at: row.get(9)?, updated_at: row.get(10)?, completed_at: row.get(11)?, deleted_at: row.get(12)?,
         images: serde_json::from_str(&row.get::<_, String>(13)?).map_err(|e| rusqlite::Error::FromSqlConversionFailure(13, rusqlite::types::Type::Text, Box::new(e)))?,
-        local_path: row.get(14)?, sms_reminder: row.get(15)?,
+        local_path: row.get(14)?, sms_reminder: row.get(15)?, email_reminder: row.get(16)?,
     })
 }
 
 fn all_tasks(conn: &Connection) -> Result<Vec<Task>, String> {
     let mut stmt = conn.prepare(
         "SELECT t.id,t.title,t.description,t.status,t.priority,t.due_at,t.category_id,c.name,c.color,
-                t.created_at,t.updated_at,t.completed_at,t.deleted_at,t.images_json,t.local_path,t.sms_reminder
+                t.created_at,t.updated_at,t.completed_at,t.deleted_at,t.images_json,t.local_path,t.sms_reminder,t.email_reminder
          FROM tasks t LEFT JOIN categories c ON c.id=t.category_id"
     ).map_err(|e| e.to_string())?;
     let tasks = stmt.query_map([], row_to_task).map_err(|e| e.to_string())?
@@ -279,14 +297,14 @@ fn validate_input(input: &TaskInput) -> Result<(), String> {
             return Err("图片格式或大小无效".into());
         }
     }
-    if input.sms_reminder && input.due_at.is_none() { return Err("短信提醒需要截止时间".into()); }
+    if input.email_reminder && input.due_at.is_none() { return Err("邮件提醒需要截止时间".into()); }
     Ok(())
 }
 
 fn load_task(conn: &Connection, id: &str) -> Result<Task, String> {
     conn.query_row(
         "SELECT t.id,t.title,t.description,t.status,t.priority,t.due_at,t.category_id,c.name,c.color,
-                t.created_at,t.updated_at,t.completed_at,t.deleted_at,t.images_json,t.local_path,t.sms_reminder
+                t.created_at,t.updated_at,t.completed_at,t.deleted_at,t.images_json,t.local_path,t.sms_reminder,t.email_reminder
          FROM tasks t LEFT JOIN categories c ON c.id=t.category_id WHERE t.id=?1",
         [id], row_to_task
     ).optional().map_err(|e| e.to_string())?.ok_or_else(|| "找不到任务".into())
@@ -328,8 +346,8 @@ pub fn task_create(input: TaskInput, state: State<'_, AppState>) -> Result<Task,
     let id = Uuid::new_v4().to_string();
     let now = Utc::now().to_rfc3339();
     conn.execute(
-        "INSERT INTO tasks(id,title,description,status,priority,due_at,category_id,created_at,updated_at,images_json,local_path,sms_reminder) VALUES(?1,?2,?3,'todo',?4,?5,?6,?7,?7,?8,?9,?10)",
-        params![id, input.title.trim(), input.description.trim(), input.priority, input.due_at, input.category_id, now, serde_json::to_string(&input.images).map_err(|e| e.to_string())?, input.local_path, input.sms_reminder]
+        "INSERT INTO tasks(id,title,description,status,priority,due_at,category_id,created_at,updated_at,images_json,local_path,sms_reminder,email_reminder) VALUES(?1,?2,?3,'todo',?4,?5,?6,?7,?7,?8,?9,?10,?11)",
+        params![id, input.title.trim(), input.description.trim(), input.priority, input.due_at, input.category_id, now, serde_json::to_string(&input.images).map_err(|e| e.to_string())?, input.local_path, input.sms_reminder, input.email_reminder]
     ).map_err(|e| e.to_string())?;
     load_task(&conn, &id)
 }
@@ -340,8 +358,8 @@ pub fn task_update(task_id: String, input: TaskInput, state: State<'_, AppState>
     let _guard = state.operations.lock().map_err(|_| "数据操作锁失败".to_string())?;
     let conn = open(&state.db_path)?;
     let changed = conn.execute(
-        "UPDATE tasks SET title=?2,description=?3,priority=?4,due_at=?5,category_id=?6,updated_at=?7,images_json=?8,local_path=?9,sms_reminder=?10 WHERE id=?1",
-        params![task_id, input.title.trim(), input.description.trim(), input.priority, input.due_at, input.category_id, Utc::now().to_rfc3339(), serde_json::to_string(&input.images).map_err(|e| e.to_string())?, input.local_path, input.sms_reminder]
+        "UPDATE tasks SET title=?2,description=?3,priority=?4,due_at=?5,category_id=?6,updated_at=?7,images_json=?8,local_path=?9,sms_reminder=?10,email_reminder=?11 WHERE id=?1",
+        params![task_id, input.title.trim(), input.description.trim(), input.priority, input.due_at, input.category_id, Utc::now().to_rfc3339(), serde_json::to_string(&input.images).map_err(|e| e.to_string())?, input.local_path, input.sms_reminder, input.email_reminder]
     ).map_err(|e| e.to_string())?;
     if changed == 0 { return Err("找不到任务".into()); }
     load_task(&conn, &task_id)
@@ -529,7 +547,8 @@ pub fn backup_restore(path: String, state: State<'_, AppState>) -> Result<(), St
     let mut conn = open(&state.db_path)?;
     conn.restore(DatabaseName::Main, &candidate, None::<fn(rusqlite::backup::Progress)>).map_err(|e| e.to_string())?;
     drop(conn);
-    initialize(&state.db_path)
+    initialize(&state.db_path)?;
+    crate::reminders::recover_interrupted(&open(&state.db_path)?)
 }
 
 #[tauri::command]
@@ -567,7 +586,7 @@ pub fn prepare_upgrade(db_path: &Path, backup_dir: &Path) -> Result<(), String> 
     let conn = open(db_path)?;
     let version: i64 = conn.query_row("SELECT COALESCE(MAX(version),0) FROM schema_migrations", [], |row| row.get(0)).unwrap_or(0);
     drop(conn);
-    if version < 2 { create_backup(db_path, backup_dir)?; }
+    if version < 3 { create_backup(db_path, backup_dir)?; }
     Ok(())
 }
 
@@ -665,6 +684,31 @@ mod tests {
         assert!(all_tasks(&conn).unwrap().is_empty());
         drop(conn);
         let _ = fs::remove_file(path);
+    }
+
+
+    #[test]
+    fn upgrade_v11_preserves_snapshots_without_converting_sms_consent() {
+        let root = std::env::temp_dir().join(format!("qingdan-v11-{}", Uuid::new_v4()));
+        let path = root.join("qingdan.sqlite3");
+        initialize(&path).unwrap();
+        let conn = open(&path).unwrap();
+        let id = all_tasks(&conn).unwrap()[0].id.clone();
+        conn.execute("UPDATE tasks SET sms_reminder=1,local_path='D:/keep' WHERE id=?1", [&id]).unwrap();
+        conn.execute_batch("ALTER TABLE tasks DROP COLUMN email_reminder; DROP TABLE email_deliveries; DELETE FROM schema_migrations WHERE version=3;").unwrap();
+        drop(conn);
+        prepare_upgrade(&path, &root.join("backups")).unwrap();
+        initialize(&path).unwrap();
+        initialize(&path).unwrap();
+        let conn = open(&path).unwrap();
+        let task = load_task(&conn, &id).unwrap();
+        assert!(task.sms_reminder);
+        assert!(!task.email_reminder);
+        assert_eq!(task.local_path.as_deref(), Some("D:/keep"));
+        assert_eq!(conn.query_row("SELECT MAX(version) FROM schema_migrations", [], |row| row.get::<_, i64>(0)).unwrap(), 3);
+        assert!(!AppSettings::default().email_enabled);
+        drop(conn);
+        fs::remove_dir_all(root).unwrap();
     }
 
 }

@@ -6,7 +6,7 @@ import { Window } from 'happy-dom'
 test('old data, filters, selection deletion and attachment backup round-trip', async () => {
   const directory = new URL('../.qa/', import.meta.url)
   await mkdir(directory, { recursive: true })
-  await writeFile(new URL('entry.ts', directory), "export { default as App } from '../src/App.vue'; export { api } from '../src/services';")
+  await writeFile(new URL('entry.ts', directory), "export { default as App } from '../src/App.vue'; export { api } from '../src/services'; export { tasksCsv, tasksJson } from '../src/export';")
   const window = new Window({ url: 'http://localhost:1420' })
   for (const key of ['window', 'document', 'localStorage', 'HTMLElement', 'Element', 'SVGElement', 'Node', 'Event', 'MouseEvent', 'location']) {
     Object.defineProperty(globalThis, key, { value: key === 'window' ? window : window[key], configurable: true })
@@ -38,7 +38,7 @@ test('old data, filters, selection deletion and attachment backup round-trip', a
   localStorage.setItem('qingdan.categories.v1', '[]')
   localStorage.setItem('qingdan.settings.v1', JSON.stringify({ startView: 'unfinished', theme: 'light', dailyBackup: true }))
   const { createApp, nextTick } = await import('vue')
-  const { App, api } = await import(new URL('output/app.mjs', directory).href)
+  const { App, api, tasksCsv, tasksJson } = await import(new URL('output/app.mjs', directory).href)
   const container = document.createElement('div')
   document.body.append(container)
   const app = createApp(App)
@@ -92,6 +92,33 @@ test('old data, filters, selection deletion and attachment backup round-trip', a
     await flush()
     assert.ok(container.textContent.includes('图片 / 进度快照'))
     assert.ok(container.querySelector('input[type=file][multiple]'))
+    assert.ok(container.textContent.includes('截止时邮件提醒'))
+    assert.ok(!container.textContent.includes('截止时短信提醒'))
+    const csvTask = { ...restored, title: '=HYPERLINK("bad")', description: '含逗号,和换行\n第二行', emailReminder: true }
+    const csv = tasksCsv([csvTask])
+    assert.equal(csv.charCodeAt(0), 0xFEFF)
+    assert.ok(csv.includes("'=HYPERLINK("))
+    assert.ok(csv.includes('"含逗号,和换行\n第二行"'))
+    assert.ok(!csv.includes(image.dataUrl))
+    const exported = JSON.parse(tasksJson([restored]))
+    assert.equal(exported.count, 1)
+    assert.deepEqual(exported.tasks[0].images, [image])
+    assert.ok(!Object.hasOwn(exported, 'settings'))
+    container.querySelector('.task-editor .modal-head button').click()
+    await flush()
+    let captured = null
+    api.exportFile = async (content, format) => { captured = { content, format }; return true }
+    await click('一键导出事项')
+    assert.equal(captured.format, 'csv')
+    // All nondeleted tasks are exported regardless of the currently selected unfinished view.
+    assert.ok(captured.content.includes('旧版已完成'))
+    assert.ok(!captured.content.includes('旧版回收站'))
+    container.querySelector('button[title="设置"]').click()
+    await flush()
+    assert.ok(container.textContent.includes('QQ 邮箱提醒'))
+    assert.ok(!container.textContent.includes('手机短信服务'))
+    assert.ok(container.querySelector('input[type="password"]').disabled)
+
   } finally {
     app.unmount()
     window.happyDOM.abort()

@@ -2,7 +2,8 @@
 import { computed, onMounted, ref, watch } from 'vue'
 import { api } from './services'
 import { MAX_IMAGES, prepareImage } from './images'
-import type { AppSettings, BackupInfo, Category, Priority, Stats, Task, TaskInput, ViewKey } from './types'
+import { tasksCsv, tasksJson } from './export'
+import type { AppSettings, BackupInfo, Category, EmailStatus, Priority, Stats, Task, TaskInput, ViewKey } from './types'
 
 const tasks = ref<Task[]>([])
 const categories = ref<Category[]>([])
@@ -25,7 +26,11 @@ const batchIds = ref<string[]>([])
 const busy = ref(false)
 const processingImages = ref(false)
 const previewImage = ref<string | null>(null)
-const smsStatus = ref('')
+const emailStatus = ref<EmailStatus>({ configured: false, sent: 0, failed: 0, uncertain: 0, lastError: null })
+const emailCode = ref('')
+const mailBusy = ref(false)
+const exportBusy = ref(false)
+const exportMenuOpen = ref(false)
 const allChecked = computed(() => tasks.value.length > 0 && tasks.value.every(task => batchIds.value.includes(task.id)))
 
 const categoryDraft = ref({ id: '', name: '', color: '#5B8FF9' })
@@ -130,20 +135,20 @@ function changeCategory(categoryId: string) {
 
 function openCreate() {
   editingTaskId.value = null
-  form.value = { title: '', description: '', priority: 'medium', dueAt: activeView.value === 'today' ? new Date(new Date().setHours(18, 0, 0, 0)).toISOString() : null, categoryId: activeView.value === 'category' ? activeCategoryId.value : null, images: [], localPath: null, smsReminder: false }
+  form.value = { title: '', description: '', priority: 'medium', dueAt: activeView.value === 'today' ? new Date(new Date().setHours(18, 0, 0, 0)).toISOString() : null, categoryId: activeView.value === 'category' ? activeCategoryId.value : null, images: [], localPath: null, emailReminder: false }
   editorOpen.value = true
 }
 
 function openEdit(task: Task) {
   editingTaskId.value = task.id
-  form.value = { title: task.title, description: task.description, priority: task.priority, dueAt: task.dueAt, categoryId: task.categoryId, images: (task.images ?? []).map(image => ({ ...image })), localPath: task.localPath ?? null, smsReminder: task.smsReminder ?? false }
+  form.value = { title: task.title, description: task.description, priority: task.priority, dueAt: task.dueAt, categoryId: task.categoryId, images: (task.images ?? []).map(image => ({ ...image })), localPath: task.localPath ?? null, smsReminder: task.smsReminder ?? false, emailReminder: task.emailReminder ?? false }
   editorOpen.value = true
 }
 
 async function submitTask() {
   if (!form.value.title.trim()) return flash('请输入任务名称')
   if (busy.value || processingImages.value) return
-  if (form.value.smsReminder && !form.value.dueAt) return flash('短信提醒需要设置截止时间')
+  if (form.value.emailReminder && !form.value.dueAt) return flash('邮件提醒需要设置截止时间')
   busy.value = true
   try {
     const input = { ...form.value, title: form.value.title.trim(), description: form.value.description.trim(), localPath: form.value.localPath?.trim() || null }
@@ -227,7 +232,8 @@ async function openDirectory(path: string) {
 
 async function openSettings() {
   settings.value = await api.getSettings()
-  smsStatus.value = await api.smsStatus()
+  emailCode.value = ''
+  emailStatus.value = await api.emailStatus(settings.value.emailAddress)
   settingsOpen.value = true
 }
 
@@ -280,12 +286,79 @@ async function restoreBackup(backup: BackupInfo) {
   flash('数据已恢复')
 }
 
+async function persistSettings() {
+  if (emailCode.value.trim()) {
+    await api.saveEmailCode(settings.value.emailAddress ?? '', emailCode.value)
+    emailCode.value = ''
+  }
+  await api.saveSettings({ ...settings.value, emailAddress: settings.value.emailAddress?.trim().toLowerCase() ?? '' })
+  emailStatus.value = await api.emailStatus(settings.value.emailAddress)
+}
+
 async function saveSettings() {
+  if (mailBusy.value) return
+  mailBusy.value = true
   try {
-    await api.saveSettings(settings.value)
+    await persistSettings()
+    emailCode.value = ''
     settingsOpen.value = false
     flash('设置已保存')
   } catch (error) { flash(`设置保存失败：${String(error)}`) }
+  finally { mailBusy.value = false }
+}
+
+function closeSettings() {
+  if (mailBusy.value) return
+  emailCode.value = ''
+  settingsOpen.value = false
+}
+
+async function testEmail() {
+  if (mailBusy.value) return
+  mailBusy.value = true
+  try {
+    await persistSettings()
+    flash(await api.testEmail())
+  } catch (error) { flash(`测试邮件未确认成功：${String(error)}`) }
+  finally { mailBusy.value = false }
+}
+
+async function clearEmailCode() {
+  if (mailBusy.value || !confirm('删除此邮箱在本机保存的授权码？需要重新填写后才能发邮件。')) return
+  mailBusy.value = true
+  try {
+    await api.clearEmailCode(settings.value.emailAddress ?? '')
+    emailCode.value = ''
+    settings.value.emailEnabled = false
+    await persistSettings()
+    flash('授权码已删除，邮件提醒已关闭')
+  } catch (error) { flash(String(error)) }
+  finally { mailBusy.value = false }
+}
+
+async function retryFailedEmails() {
+  if (mailBusy.value) return
+  mailBusy.value = true
+  try {
+    await persistSettings()
+    const count = await api.retryFailedEmails()
+    emailStatus.value = await api.emailStatus(settings.value.emailAddress)
+    flash(`${count} 条失败提醒已加入重试队列`)
+  } catch (error) { flash(String(error)) }
+  finally { mailBusy.value = false }
+}
+
+async function exportTasks(scope: 'all' | 'current' = 'all', format: 'csv' | 'json' = 'csv') {
+  if (exportBusy.value) return
+  exportBusy.value = true
+  exportMenuOpen.value = false
+  try {
+    const items = scope === 'current' ? [...tasks.value] : await api.listTasks({ view: 'all', search: '' })
+    const content = format === 'csv' ? tasksCsv(items) : tasksJson(items)
+    const saved = await api.exportFile(content, format)
+    if (saved) flash(`已导出 ${items.length} 项事项`)
+  } catch (error) { flash(`导出失败：${String(error)}`) }
+  finally { exportBusy.value = false }
 }
 
 let debounce: number | undefined
@@ -334,7 +407,7 @@ onMounted(async () => {
       </nav>
       <div class="privacy-card">
         <span>⌂</span>
-        <div><strong>数据只在此设备</strong><p>{{ settings.smsEnabled ? '短信启用时会发送提醒内容' : '不上传云端，隐私更安心' }}</p></div>
+        <div><strong>数据只在此设备</strong><p>{{ settings.emailEnabled ? '邮件启用时会发送事项与截止时间' : '不上传云端，隐私更安心' }}</p></div>
       </div>
     </aside>
 
@@ -342,7 +415,10 @@ onMounted(async () => {
       <section class="task-panel">
         <div class="page-head">
           <div><h1>{{ title }}</h1><p>{{ subtitle }}</p></div>
-          <button class="secondary-button" @click="openCreate">＋ 添加任务</button>
+          <div class="page-actions">
+            <div class="export-actions"><button class="secondary-button" :disabled="exportBusy" title="导出全部未删除事项，包含已完成，CSV 可用 Excel 打开" @click="exportTasks()">{{ exportBusy ? '导出中…' : '一键导出事项' }}</button><button class="plain-button" aria-label="更多导出选项" :aria-expanded="exportMenuOpen" @click="exportMenuOpen = !exportMenuOpen">⌄</button><div v-if="exportMenuOpen" class="export-menu"><button @click="exportTasks('current')">导出当前列表 CSV（{{ tasks.length }} 项）</button><button @click="exportTasks('all', 'json')">导出全部事项 JSON（含图片）</button><p>默认导出全部未删除事项；CSV 包含图片名称，JSON 包含完整图片。</p></div></div>
+            <button class="secondary-button" @click="openCreate">＋ 添加任务</button>
+          </div>
         </div>
 
         <div v-if="activeView === 'today'" class="stats-row">
@@ -376,7 +452,7 @@ onMounted(async () => {
                 <span v-if="task.dueAt" :class="{ overdue: isOverdue(task) }">◷ {{ dueLabel(task.dueAt) }}</span>
                 <span v-if="task.images?.length">▧ {{ task.images.length }}</span>
                 <span v-if="task.localPath">▱ 文件夹</span>
-                <span v-if="task.smsReminder">短信提醒</span>
+                <span v-if="task.emailReminder">邮件提醒</span>
                 <span :class="`priority ${task.priority}`">◆ {{ priorityLabel(task.priority) }}</span>
               </div>
             </div>
@@ -410,7 +486,7 @@ onMounted(async () => {
               <button v-for="image in selectedTask.images" :key="image.id" :title="image.name" @click="previewImage = image.dataUrl"><img :src="image.dataUrl" :alt="image.name" /></button>
             </div>
             <button v-if="selectedTask.localPath" class="directory-link" :title="selectedTask.localPath" @click="openDirectory(selectedTask.localPath)">▱ 打开本地文件夹<br /><small>{{ selectedTask.localPath }}</small></button>
-            <p v-if="selectedTask.smsReminder" class="helper">{{ settings.smsEnabled ? '截止时短信提醒已勾选，需保持桌面应用运行。' : '任务已勾选短信提醒，请先在设置中启用短信服务。' }}</p>
+            <p v-if="selectedTask.emailReminder" class="helper">{{ settings.emailEnabled ? '截止时邮件提醒已勾选，需保持电脑和清单运行。' : '任务已勾选邮件提醒，请先在设置中启用 QQ 邮箱提醒。' }}</p>
             <button v-if="activeView !== 'trash'" class="primary-wide" @click="openEdit(selectedTask)">编辑任务</button>
             <button v-if="selectedTask.status !== 'completed' && activeView !== 'trash'" class="ghost-wide" @click="toggleTask(selectedTask)">标记为已完成</button>
             <button v-if="activeView === 'trash'" class="primary-wide" @click="restoreTask(selectedTask)">恢复任务</button>
@@ -440,7 +516,7 @@ onMounted(async () => {
           </div>
         </section>
         <label><span>关联本地文件夹</span><div class="path-input"><input v-model="form.localPath" placeholder="例如 D:\项目资料" /><button v-if="api.desktop" type="button" class="plain-button" @click="pickDirectory">选择目录</button></div></label>
-        <label class="switch-row"><div><strong>截止时短信提醒</strong><small>{{ api.desktop ? '需在设置中启用短信服务才会发送；应用关闭时无法发送' : '需要 Windows 桌面版配置短信服务' }}</small></div><input v-model="form.smsReminder" type="checkbox" :disabled="!api.desktop" /></label>
+        <label class="switch-row"><div><strong>截止时邮件提醒</strong><small>{{ api.desktop ? '需在设置中配置 QQ 邮箱；电脑和应用关闭时不发送' : '需要 Windows 桌面版配置 QQ 邮箱' }}</small></div><input v-model="form.emailReminder" type="checkbox" :disabled="!api.desktop" /></label>
         <div class="modal-actions"><button type="button" class="plain-button" @click="editorOpen = false">取消</button><button class="primary-button" :disabled="busy || processingImages">{{ editingTaskId ? '保存更改' : '创建任务' }}</button></div>
       </form>
     </div>
@@ -455,22 +531,23 @@ onMounted(async () => {
       </section>
     </div>
 
-    <div v-if="settingsOpen" class="modal-backdrop" @click.self="settingsOpen = false">
+    <div v-if="settingsOpen" class="modal-backdrop" @click.self="closeSettings">
       <section class="modal small-modal">
-        <div class="modal-head"><div><small>偏好设置</small><h2>应用设置</h2></div><button @click="settingsOpen = false">×</button></div>
+        <div class="modal-head"><div><small>偏好设置</small><h2>应用设置</h2></div><button @click="closeSettings">×</button></div>
         <label><span>启动时打开</span><select v-model="settings.startView"><option value="today">今日任务</option><option value="inbox">收集箱</option><option value="upcoming">即将到期</option><option value="unfinished">未完成</option><option value="all">全部任务</option></select></label>
         <label class="switch-row"><div><strong>每日自动备份</strong><small>桌面版每天首次启动时创建本地备份</small></div><input v-model="settings.dailyBackup" type="checkbox" /></label>
-        <section class="sms-settings">
-          <label class="switch-row"><div><strong>手机短信服务</strong><small>仅桌面版；按任务勾选，截止后每 30 秒检查</small></div><input v-model="settings.smsEnabled" type="checkbox" :disabled="!api.desktop" /></label>
-          <template v-if="api.desktop">
-            <label><span>接收手机号（国际格式）</span><input v-model="settings.smsPhone" type="tel" placeholder="+8613800000000" /></label>
-            <label><span>短信中转服务 HTTPS 地址</span><input v-model="settings.smsWebhookUrl" type="url" placeholder="https://你的服务地址/reminders" /></label>
-            <p class="helper">服务密钥通过电脑环境变量 QINGDAN_SMS_TOKEN 配置，修改后重启应用。短信可能产生费用，仅向填写的手机号发送任务标题和截止时间。</p>
-          </template>
-          <p class="helper" role="status">{{ smsStatus }}</p>
+        <section class="email-settings">
+          <label class="switch-row"><div><strong>QQ 邮箱提醒</strong><small>用自己的邮箱发给自己；截止后每 30 秒检查一项任务</small></div><input v-model="settings.emailEnabled" type="checkbox" :disabled="!api.desktop || mailBusy" /></label>
+          <label><span>QQ 邮箱地址</span><input v-model="settings.emailAddress" type="email" placeholder="你的QQ号@qq.com" :disabled="!api.desktop || mailBusy" @change="emailStatus = { configured: false, sent: 0, failed: 0, uncertain: 0, lastError: null }" /></label>
+          <label><span>SMTP 授权码（不是 QQ 登录密码）</span><input v-model="emailCode" type="password" autocomplete="new-password" :placeholder="emailStatus.configured ? '已保存；留空保留，填写则更新' : '在 QQ 邮箱设置中开启 SMTP 并生成授权码'" :disabled="!api.desktop || mailBusy" /></label>
+          <p class="helper">电脑打开 mail.qq.com，在设置中查找 POP3/IMAP/SMTP 服务并生成授权码。只在这里填写，不要发到聊天里。授权码由 Windows 凭据管理器保存，不写进任务数据库或导出文件。</p>
+          <p class="helper">保持电脑和清单运行；重开仅补发 24 小时内到期事项。手机需在 QQ 邮箱 App 中开启通知。旧短信开关不会自动改为邮件提醒，请给需要的事项重新勾选。</p>
+          <div class="email-actions"><button class="secondary-button" :disabled="!api.desktop || mailBusy" @click="testEmail">{{ mailBusy ? '处理中…' : '保存并发送测试邮件' }}</button><button class="plain-button" :disabled="!api.desktop || mailBusy" @click="clearEmailCode">删除已存授权码</button><button v-if="emailStatus.failed" class="plain-button" :disabled="mailBusy" @click="retryFailedEmails">重试失败提醒</button></div>
+          <p class="helper" role="status">{{ api.desktop ? (emailStatus.configured ? '授权码已保存' : '此邮箱授权码未配置') : '请使用 Windows 桌面版配置邮件' }}；已受理 {{ emailStatus.sent }} 条，失败 {{ emailStatus.failed }} 条，结果不确定 {{ emailStatus.uncertain }} 条。受理不保证手机提示，请检查收件箱和垃圾邮件。</p>
+          <p v-if="emailStatus.lastError" class="helper mail-error">{{ emailStatus.lastError }}</p>
         </section>
-        <div class="about-card"><strong>清单 v1.1.0</strong><span>离线优先 · 本地存储 · 无需账号</span></div>
-        <div class="modal-actions"><button class="plain-button" @click="settingsOpen = false">取消</button><button class="primary-button" @click="saveSettings">保存设置</button></div>
+        <div class="about-card"><strong>清单 v1.2.0</strong><span>离线优先 · 本地存储 · 无需账号</span></div>
+        <div class="modal-actions"><button class="plain-button" @click="closeSettings">取消</button><button class="primary-button" :disabled="mailBusy" @click="saveSettings">保存设置</button></div>
       </section>
     </div>
 

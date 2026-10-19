@@ -33,6 +33,7 @@ export interface Task {
   images?: TaskImage[]
   localPath?: string | null
   smsReminder?: boolean
+  emailReminder?: boolean
 }
 
 export interface TaskInput {
@@ -44,6 +45,7 @@ export interface TaskInput {
   images?: TaskImage[]
   localPath?: string | null
   smsReminder?: boolean
+  emailReminder?: boolean
 }
 
 export interface TaskFilter {
@@ -75,8 +77,18 @@ export interface AppSettings {
   startView: ViewKey
   theme: 'light' | 'system'
   dailyBackup: boolean
+  emailEnabled?: boolean
+  emailAddress?: string
   smsEnabled?: boolean
   smsPhone?: string
   smsWebhookUrl?: string
 }
 
+
+export interface EmailStatus {
+  configured: boolean
+  sent: number
+  failed: number
+  uncertain: number
+  lastError: string | null
+}

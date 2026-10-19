@@ -1,4 +1,4 @@
-import type { AppSettings, BackupInfo, Category, Stats, Task, TaskFilter, TaskInput } from './types'
+import type { AppSettings, BackupInfo, Category, EmailStatus, Stats, Task, TaskFilter, TaskInput } from './types'
 
 const TASK_KEY = 'qingdan.tasks.v1'
 const CATEGORY_KEY = 'qingdan.categories.v1'
@@ -200,9 +200,43 @@ export const api = {
     if (!response.ok) throw new Error('文件夹不存在或无法打开')
   },
 
-  async smsStatus(): Promise<string> {
-    if (!isDesktop()) return '短信提醒需要 Windows 桌面版'
-    return command('sms_status')
+  async emailStatus(address = ''): Promise<EmailStatus> {
+    if (!isDesktop()) return { configured: false, sent: 0, failed: 0, uncertain: 0, lastError: null }
+    return command('email_status', { address })
+  },
+
+  async saveEmailCode(address: string, authCode: string): Promise<void> {
+    if (!isDesktop()) throw new Error('请使用 Windows 桌面版配置邮件提醒')
+    return command('email_auth_save', { address, authCode })
+  },
+
+  async clearEmailCode(address: string): Promise<void> {
+    if (!isDesktop()) throw new Error('请使用 Windows 桌面版管理授权码')
+    return command('email_auth_clear', { address })
+  },
+
+  async testEmail(): Promise<string> {
+    if (!isDesktop()) throw new Error('请使用 Windows 桌面版发送测试邮件')
+    return command('email_test')
+  },
+
+  async retryFailedEmails(): Promise<number> {
+    if (!isDesktop()) throw new Error('请使用 Windows 桌面版重试邮件')
+    return command('email_retry_failed')
+  },
+
+  async exportFile(content: string, format: 'csv' | 'json'): Promise<boolean> {
+    if (isDesktop()) return Boolean(await command<string | null>('tasks_export_save', { content, format }))
+    const blob = new Blob([content], { type: format === 'csv' ? 'text/csv;charset=utf-8' : 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `清单事项-${new Date().toISOString().replace(/[:.]/g, '-')}.${format}`
+    document.body.append(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    return true
   },
 
   async restoreTask(taskId: string): Promise<void> {
