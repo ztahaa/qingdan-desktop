@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { api } from './services'
 import { MAX_IMAGES, prepareImage } from './images'
 import { tasksCsv, tasksJson } from './export'
@@ -13,6 +13,7 @@ const activeView = ref<ViewKey | 'category'>('today')
 const activeCategoryId = ref<string | null>(null)
 const search = ref('')
 const selectedId = ref<string | null>(null)
+const detailOpen = ref(true)
 const loading = ref(true)
 const editorOpen = ref(false)
 const categoryOpen = ref(false)
@@ -124,6 +125,35 @@ function changeView(view: ViewKey) {
   batchIds.value = []
   activeView.value = view
   activeCategoryId.value = null
+}
+
+function showTask(task: Task) {
+  selectedId.value = task.id
+  detailOpen.value = true
+}
+
+function closeDetail() {
+  detailOpen.value = false
+  selectedId.value = null
+}
+
+function closeEditor() {
+  if (busy.value || processingImages.value) return
+  editorOpen.value = false
+}
+
+function handleEscape(event: KeyboardEvent) {
+  if (event.key !== 'Escape') return
+  if (previewImage.value) previewImage.value = null
+  else if (editorOpen.value) closeEditor()
+  else if (settingsOpen.value) closeSettings()
+  else if (categoryOpen.value) categoryOpen.value = false
+  else if (backupOpen.value) backupOpen.value = false
+  else if (exportMenuOpen.value) exportMenuOpen.value = false
+  else if (detailOpen.value && selectedTask.value) closeDetail()
+  else return
+  event.preventDefault()
+  event.stopPropagation()
 }
 
 function changeCategory(categoryId: string) {
@@ -369,9 +399,14 @@ watch(search, () => {
 })
 
 onMounted(async () => {
+  window.addEventListener('keydown', handleEscape)
   settings.value = await api.getSettings()
   activeView.value = settings.value.startView
   await refresh()
+})
+onUnmounted(() => {
+  window.removeEventListener('keydown', handleEscape)
+  window.clearTimeout(debounce)
 })
 </script>
 
@@ -411,7 +446,7 @@ onMounted(async () => {
       </div>
     </aside>
 
-    <main class="workspace">
+    <main class="workspace" :class="{ 'with-detail': detailOpen && selectedTask }">
       <section class="task-panel">
         <div class="page-head">
           <div><h1>{{ title }}</h1><p>{{ subtitle }}</p></div>
@@ -440,7 +475,7 @@ onMounted(async () => {
         </div>
 
         <div class="task-list" :class="{ loading }">
-          <article v-for="task in tasks" :key="task.id" class="task-row" :class="[`priority-${task.priority}`, { selected: selectedId === task.id, done: task.status === 'completed' }]" @click="batchMode ? toggleBatch(task.id) : selectedId = task.id">
+          <article v-for="task in tasks" :key="task.id" class="task-row" :class="[`priority-${task.priority}`, { selected: detailOpen && selectedId === task.id, done: task.status === 'completed' }]" @click="batchMode ? toggleBatch(task.id) : showTask(task)">
             <input v-if="batchMode" class="batch-check" type="checkbox" :aria-label="`选择 ${task.title}`" :checked="batchIds.includes(task.id)" @click.stop @change="toggleBatch(task.id)" />
             <button v-else-if="activeView !== 'trash'" class="check" :class="{ checked: task.status === 'completed' }" :aria-label="task.status === 'completed' ? '恢复任务' : '完成任务'" @click.stop="toggleTask(task)">{{ task.status === 'completed' ? '✓' : '' }}</button>
             <span v-else class="trash-dot">♲</span>
@@ -470,9 +505,9 @@ onMounted(async () => {
         </div>
       </section>
 
-      <aside class="focus-panel">
+      <aside v-if="detailOpen && selectedTask" class="focus-panel">
         <template v-if="selectedTask">
-          <div class="focus-head"><span>任务详情</span><button @click="selectedId = null">×</button></div>
+          <div class="focus-head"><span>任务详情</span><button aria-label="关闭任务详情" @click="closeDetail">×</button></div>
           <div class="focus-body">
             <span class="focus-status">{{ selectedTask.status === 'completed' ? '已完成' : '待处理' }}</span>
             <h2>{{ selectedTask.title }}</h2>
@@ -493,13 +528,12 @@ onMounted(async () => {
           </div>
           <div class="focus-tip"><span>✦</span><p><strong>小提示</strong><br />把大任务拆成小步骤，更容易开始。</p></div>
         </template>
-        <div v-else class="no-selection"><span>☑</span><h3>选择一个任务</h3><p>在这里查看详情并快速编辑</p></div>
       </aside>
     </main>
 
-    <div v-if="editorOpen" class="modal-backdrop" @click.self="editorOpen = false">
+    <div v-if="editorOpen" class="modal-backdrop" @click.self="closeEditor">
       <form class="modal task-editor" @submit.prevent="submitTask" @paste="pasteImage">
-        <div class="modal-head"><div><small>{{ editingTaskId ? '编辑任务' : '新建任务' }}</small><h2>{{ editingTaskId ? '完善任务内容' : '记录要做的事情' }}</h2></div><button type="button" @click="editorOpen = false">×</button></div>
+        <div class="modal-head"><div><small>{{ editingTaskId ? '编辑任务' : '新建任务' }}</small><h2>{{ editingTaskId ? '完善任务内容' : '记录要做的事情' }}</h2></div><button type="button" @click="closeEditor">×</button></div>
         <label><span>任务名称 *</span><input v-model="form.title" autofocus maxlength="120" placeholder="例如：完成项目周报" /></label>
         <label><span>任务说明</span><textarea v-model="form.description" rows="4" maxlength="1000" placeholder="补充一些细节…"></textarea></label>
         <div class="form-grid">
@@ -517,7 +551,7 @@ onMounted(async () => {
         </section>
         <label><span>关联本地文件夹</span><div class="path-input"><input v-model="form.localPath" placeholder="例如 D:\项目资料" /><button v-if="api.desktop" type="button" class="plain-button" @click="pickDirectory">选择目录</button></div></label>
         <label class="switch-row"><div><strong>截止时邮件提醒</strong><small>{{ api.desktop ? '需在设置中配置 QQ 邮箱；电脑和应用关闭时不发送' : '需要 Windows 桌面版配置 QQ 邮箱' }}</small></div><input v-model="form.emailReminder" type="checkbox" :disabled="!api.desktop" /></label>
-        <div class="modal-actions"><button type="button" class="plain-button" @click="editorOpen = false">取消</button><button class="primary-button" :disabled="busy || processingImages">{{ editingTaskId ? '保存更改' : '创建任务' }}</button></div>
+        <div class="modal-actions"><button type="button" class="plain-button" @click="closeEditor">取消</button><button class="primary-button" :disabled="busy || processingImages">{{ editingTaskId ? '保存更改' : '创建任务' }}</button></div>
       </form>
     </div>
 
@@ -546,7 +580,7 @@ onMounted(async () => {
           <p class="helper" role="status">{{ api.desktop ? (emailStatus.configured ? '授权码已保存' : '此邮箱授权码未配置') : '请使用 Windows 桌面版配置邮件' }}；已受理 {{ emailStatus.sent }} 条，失败 {{ emailStatus.failed }} 条，结果不确定 {{ emailStatus.uncertain }} 条。受理不保证手机提示，请检查收件箱和垃圾邮件。</p>
           <p v-if="emailStatus.lastError" class="helper mail-error">{{ emailStatus.lastError }}</p>
         </section>
-        <div class="about-card"><strong>清单 v1.2.1</strong><span>离线优先 · 本地存储 · 无需账号</span></div>
+        <div class="about-card"><strong>清单 v1.2.2</strong><span>离线优先 · 本地存储 · 无需账号</span></div>
         <div class="modal-actions"><button class="plain-button" @click="closeSettings">取消</button><button class="primary-button" :disabled="mailBusy" @click="saveSettings">保存设置</button></div>
       </section>
     </div>

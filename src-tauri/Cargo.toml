@@ -1,6 +1,6 @@
 [package]
 name = "qingdan-desktop"
-version = "1.2.1"
+version = "1.2.2"
 description = "本地优先的待办事项桌面应用"
 authors = ["Qingdan"]
 edition = "2021"
