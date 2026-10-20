@@ -1,4 +1,4 @@
-import type { AppSettings, BackupInfo, Category, Stats, Task, TaskFilter, TaskInput } from './types'
+import type { AppSettings, BackupInfo, Category, EmailStatus, Stats, Task, TaskFilter, TaskInput } from './types'
 
 const TASK_KEY = 'qingdan.tasks.v1'
 const CATEGORY_KEY = 'qingdan.categories.v1'
@@ -118,7 +118,8 @@ function matchesFilter(task: Task, filter: TaskFilter) {
     end.setHours(23, 59, 59, 999)
     if (!(active && due && due > today && due <= end)) return false
   }
-  if (filter.view === 'all' && !active) return false
+  if (filter.view === 'unfinished' && !active) return false
+  if (filter.view === 'all' && task.deletedAt) return false
   if (filter.view === 'completed' && !(task.status === 'completed' && !task.deletedAt)) return false
   if (filter.view === 'trash' && !task.deletedAt) return false
   if (filter.view === 'category' && !(active && task.categoryId === filter.categoryId)) return false
@@ -169,6 +170,75 @@ export const api = {
     await persistPortable()
   },
 
+  async deleteTasks(taskIds: string[], permanent = false): Promise<void> {
+    if (isDesktop()) return command('task_delete_many', { taskIds, permanent })
+    await ensurePortable()
+    const ids = new Set(taskIds)
+    const stamp = now()
+    write(TASK_KEY, tasksLocal().flatMap(task => {
+      if (!ids.has(task.id)) return [task]
+      if (permanent) {
+        if (!task.deletedAt) throw new Error('只能永久删除回收站中的任务')
+        return []
+      }
+      return [{ ...task, deletedAt: stamp, updatedAt: stamp }]
+    }))
+    await persistPortable()
+  },
+
+  async pickDirectory(): Promise<string | null> {
+    if (!isDesktop()) throw new Error('请手动输入文件夹的完整路径')
+    return command('directory_pick')
+  },
+
+  async openDirectory(path: string): Promise<void> {
+    if (isDesktop()) return command('directory_open', { path })
+    if (!isPortableServer()) throw new Error('请使用 Windows 桌面版打开本地文件夹')
+    const response = await fetch('/api/open-directory', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ path })
+    })
+    if (!response.ok) throw new Error('文件夹不存在或无法打开')
+  },
+
+  async emailStatus(address = ''): Promise<EmailStatus> {
+    if (!isDesktop()) return { configured: false, sent: 0, failed: 0, uncertain: 0, lastError: null }
+    return command('email_status', { address })
+  },
+
+  async saveEmailCode(address: string, authCode: string): Promise<void> {
+    if (!isDesktop()) throw new Error('请使用 Windows 桌面版配置邮件提醒')
+    return command('email_auth_save', { address, authCode })
+  },
+
+  async clearEmailCode(address: string): Promise<void> {
+    if (!isDesktop()) throw new Error('请使用 Windows 桌面版管理授权码')
+    return command('email_auth_clear', { address })
+  },
+
+  async testEmail(): Promise<string> {
+    if (!isDesktop()) throw new Error('请使用 Windows 桌面版发送测试邮件')
+    return command('email_test')
+  },
+
+  async retryFailedEmails(): Promise<number> {
+    if (!isDesktop()) throw new Error('请使用 Windows 桌面版重试邮件')
+    return command('email_retry_failed')
+  },
+
+  async exportFile(content: string, format: 'csv' | 'json'): Promise<boolean> {
+    if (isDesktop()) return Boolean(await command<string | null>('tasks_export_save', { content, format }))
+    const blob = new Blob([content], { type: format === 'csv' ? 'text/csv;charset=utf-8' : 'application/json;charset=utf-8' })
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = `清单事项-${new Date().toISOString().replace(/[:.]/g, '-')}.${format}`
+    document.body.append(link)
+    link.click()
+    link.remove()
+    window.setTimeout(() => URL.revokeObjectURL(url), 1000)
+    return true
+  },
+
   async restoreTask(taskId: string): Promise<void> {
     if (isDesktop()) return command('task_restore', { taskId })
     await ensurePortable()
@@ -189,7 +259,8 @@ export const api = {
       today: active.filter(task => task.dueAt && isSameDay(new Date(task.dueAt), current)).length,
       inbox: active.filter(task => !task.categoryId).length,
       upcoming: active.filter(task => task.dueAt && new Date(task.dueAt) > current && new Date(task.dueAt) <= end).length,
-      all: active.length,
+      all: tasks.filter(task => !task.deletedAt).length,
+      unfinished: active.length,
       completed: tasks.filter(task => !task.deletedAt && task.status === 'completed').length,
       trash: tasks.filter(task => task.deletedAt).length,
       overdue: active.filter(task => task.dueAt && new Date(task.dueAt) < current && !isSameDay(new Date(task.dueAt), current)).length,
@@ -258,6 +329,7 @@ export const api = {
     const backup = read<(BackupInfo & { snapshot: string })[]>(BACKUP_KEY, []).find(item => item.name === path || item.path === path)
     if (!backup) throw new Error('找不到备份')
     const data = JSON.parse(backup.snapshot)
+    await this.createBackup()
     write(TASK_KEY, data.tasks)
     write(CATEGORY_KEY, data.categories)
     write(SETTINGS_KEY, data.settings)
@@ -272,3 +344,4 @@ export const api = {
     await persistPortable()
   }
 }
+

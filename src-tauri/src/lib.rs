@@ -1,4 +1,7 @@
 mod db;
+mod directories;
+mod reminders;
+mod mail_content;
 
 use std::fs;
 use tauri::Manager;
@@ -18,12 +21,14 @@ pub fn run() {
             let backup_dir = app_dir.join("backups");
             fs::create_dir_all(&backup_dir)?;
             let db_path = app_dir.join("qingdan.sqlite3");
+            db::prepare_upgrade(&db_path, &backup_dir).map_err(std::io::Error::other)?;
             db::initialize(&db_path).map_err(std::io::Error::other)?;
             if db::daily_backup_enabled(&db_path).map_err(std::io::Error::other)? {
                 db::create_daily_backup_if_needed(&db_path, &backup_dir)
                     .map_err(std::io::Error::other)?;
             }
-            app.manage(db::AppState { db_path, backup_dir });
+            app.manage(db::AppState { db_path, backup_dir, operations: std::sync::Mutex::new(()) });
+            reminders::start(app.handle().clone());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -32,6 +37,15 @@ pub fn run() {
             db::task_update,
             db::task_complete,
             db::task_delete,
+            db::task_delete_many,
+            directories::directory_pick,
+            directories::directory_open,
+            reminders::email_status,
+            reminders::email_auth_save,
+            reminders::email_auth_clear,
+            reminders::email_test,
+            reminders::email_retry_failed,
+            directories::tasks_export_save,
             db::task_restore,
             db::stats_get,
             db::category_list,
@@ -47,3 +61,4 @@ pub fn run() {
         .run(tauri::generate_context!())
         .expect("启动清单应用失败");
 }
+
